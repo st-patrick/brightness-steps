@@ -55,9 +55,22 @@ static class Program
         {
             Application.EnableVisualStyles();
             KeyConfig.Load();
-            using (var dlg = new SetupForm())
-                if (dlg.ShowDialog() == DialogResult.OK) KeyConfig.Save(dlg.Down, dlg.Up);
-            return;
+            try
+            {
+                using (var dlg = new SetupForm())
+                    if (dlg.ShowDialog() == DialogResult.OK) KeyConfig.Save(dlg.Down, dlg.Up);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(ex.ToString());
+                MessageBox.Show("Setup could not start: " + ex.Message, "BrightnessSteps",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
+            // Tell an already-running instance to pick the new keys up, then
+            // fall through: if none is running, this process becomes the tray
+            // app, so finishing setup always leaves an icon behind.
+            SignalReload();
         }
 
         bool fresh;
@@ -67,6 +80,19 @@ static class Program
             Application.EnableVisualStyles();
             Application.Run(new TrayApp());
         }
+    }
+
+    public const string ReloadEventName = "BrightnessStepsReloadKeys";
+
+    static void SignalReload()
+    {
+        try
+        {
+            EventWaitHandle ev;
+            if (EventWaitHandle.TryOpenExisting(ReloadEventName, out ev))
+                using (ev) ev.Set();
+        }
+        catch { }
     }
 }
 
@@ -316,6 +342,7 @@ class TrayApp : ApplicationContext
     readonly Guard _guard;
     RawInputListener _raw;
     KeyboardWatch _keys;
+    volatile bool _stopping;
 
     // Key presses arrive on the raw-input thread; the menu and the slider
     // watcher run on the UI thread. Everything shared between them is either
@@ -354,13 +381,8 @@ class TrayApp : ApplicationContext
                 ToolTipIcon.Warning);
 
         KeyConfig.Load();
-        _raw = new RawInputListener(KeyConfig.Collections(), KeyConfig.Pages());
-        _raw.UsageSeen += OnUsage;
-        if (KeyConfig.NeedsKeyboardHook)
-        {
-            _keys = new KeyboardWatch();
-            _keys.KeyDown += OnVirtualKey;
-        }
+        RebuildListeners();
+        WatchForReload();
 
         StartBrightnessWatcher();
     }
@@ -433,6 +455,14 @@ class TrayApp : ApplicationContext
             KeyConfig.Save(dlg.Down, dlg.Up);
         }
 
+        RebuildListeners();
+        _tray.ShowBalloonTip(5000, "BrightnessSteps",
+            "Keys set: " + KeyConfig.Down.Describe() + " / " + KeyConfig.Up.Describe(), ToolTipIcon.Info);
+    }
+
+    /// <summary>Re-reads the key config and re-attaches input. Safe to call repeatedly.</summary>
+    void RebuildListeners()
+    {
         if (_raw != null) { _raw.Dispose(); _raw = null; }
         if (_keys != null) { _keys.Dispose(); _keys = null; }
 
@@ -443,9 +473,37 @@ class TrayApp : ApplicationContext
             _keys = new KeyboardWatch();
             _keys.KeyDown += OnVirtualKey;
         }
+    }
 
-        _tray.ShowBalloonTip(5000, "BrightnessSteps",
-            "Keys set: " + KeyConfig.Down.Describe() + " / " + KeyConfig.Up.Describe(), ToolTipIcon.Info);
+    /// <summary>
+    /// A separate `--setup` run saves new keys and signals this. Reload rather
+    /// than making the user restart the tray app to see the change.
+    /// </summary>
+    void WatchForReload()
+    {
+        var t = new Thread(() =>
+        {
+            using (var ev = new EventWaitHandle(false, EventResetMode.AutoReset, Program.ReloadEventName))
+                while (!_stopping)
+                {
+                    if (!ev.WaitOne(1000)) continue;
+                    try
+                    {
+                        _sync.BeginInvoke((Action)(() =>
+                        {
+                            KeyConfig.Load();
+                            RebuildListeners();
+                            _tray.ShowBalloonTip(5000, "BrightnessSteps",
+                                "Keys set: " + KeyConfig.Down.Describe() + " / " + KeyConfig.Up.Describe(),
+                                ToolTipIcon.Info);
+                        }));
+                    }
+                    catch { }
+                }
+        });
+        t.IsBackground = true;
+        t.Name = "brightness-reload";
+        t.Start();
     }
 
     static Icon LoadAppIcon()
@@ -461,6 +519,7 @@ class TrayApp : ApplicationContext
 
     void Shutdown()
     {
+        _stopping = true;
         if (_raw != null) { _raw.Dispose(); _raw = null; }
         if (_keys != null) { _keys.Dispose(); _keys = null; }
         _guard.Dispose();
@@ -1638,6 +1697,14 @@ class SetupForm : Form
     readonly System.Collections.Generic.Dictionary<string, int> _phase2 = new System.Collections.Generic.Dictionary<string, int>();
     readonly System.Collections.Generic.Dictionary<string, KeySignal> _signals = new System.Collections.Generic.Dictionary<string, KeySignal>();
 
+    // Touchscreens, pens and sensors emit continuously. Whatever is already
+    // chattering before the user presses anything is recorded here and then
+    // ignored - without this, a Surface's digitizer wins on sheer volume and
+    // gets learned as the brightness key.
+    readonly System.Collections.Generic.HashSet<string> _ambient = new System.Collections.Generic.HashSet<string>();
+    readonly System.Windows.Forms.Timer _calibrate = new System.Windows.Forms.Timer();
+    bool _calibrating;
+
     int _phase;                 // 0 = darker, 1 = brighter, 2 = result
     public KeySignal Down, Up;
 
@@ -1677,8 +1744,11 @@ class SetupForm : Form
 
         Controls.AddRange(new Control[] { _step, _hint, _status, _next, _cancel });
 
+        _calibrate.Interval = 1500;
+        _calibrate.Tick += (s, e) => { _calibrate.Stop(); _calibrating = false; ShowStatus(); };
+
         Load += (s, e) => Begin();
-        FormClosed += (s, e) => StopListening();
+        FormClosed += (s, e) => { _calibrate.Stop(); StopListening(); };
     }
 
     void Begin()
@@ -1716,14 +1786,26 @@ class SetupForm : Form
     void RecordOnUi(KeySignal sig)
     {
         if (_phase > 1) return;
+
+        if (sig.IsHid)
+        {
+            if (sig.Usage == 0) return;                     // a release, not a press
+            // A brightness key is never on the digitizer or sensor pages, and
+            // those are exactly the ones that stream constantly.
+            if (sig.Page == 0x0D || sig.Page == 0x20) return;
+        }
+
         string key = sig.ToString();
         _signals[key] = sig;
+
+        if (_calibrating) { _ambient.Add(key); return; }
+        if (_ambient.Contains(key)) return;                 // was already chattering
 
         var bucket = _phase == 0 ? _phase1 : _phase2;
         int n;
         bucket[key] = bucket.TryGetValue(key, out n) ? n + 1 : 1;
 
-        _next.Enabled = Candidates().Length > 0 || _phase == 1;
+        _next.Enabled = Candidates().Length > 0;
         ShowStatus();
     }
 
@@ -1735,7 +1817,13 @@ class SetupForm : Form
 
         var list = new System.Collections.Generic.List<string>();
         foreach (var kv in mine) if (!other.ContainsKey(kv.Key)) list.Add(kv.Key);
-        list.Sort((a, b) => mine[b].CompareTo(mine[a]));
+        list.Sort((a, b) =>
+        {
+            bool ca = _signals[a].IsHid && _signals[a].Page == 0x0C;
+            bool cb = _signals[b].IsHid && _signals[b].Page == 0x0C;
+            if (ca != cb) return ca ? -1 : 1;                // the standard page wins ties
+            return mine[b].CompareTo(mine[a]);
+        });
         return list.ToArray();
     }
 
@@ -1745,25 +1833,37 @@ class SetupForm : Form
         {
             _step.Text = "1 of 2 - press your DARKER key";
             _hint.Text = "Press the key you use to make the screen dimmer, three or four times.\r\n\r\n"
-                       + "Press nothing else. If your keys need Fn, hold Fn as you normally would.";
+                       + "Wait for the prompt below, then press nothing else. If your keys need Fn, "
+                       + "hold Fn as you normally would.";
             _next.Text = "Continue";
         }
         else if (_phase == 1)
         {
             _step.Text = "2 of 2 - press your BRIGHTER key";
             _hint.Text = "Now press the key you use to make the screen brighter, three or four times.\r\n\r\n"
-                       + "Press nothing else.";
+                       + "Wait for the prompt below, then press nothing else.";
             _next.Text = "Continue";
         }
         _next.Enabled = false;
+
+        // Listen first, press second: sample what is already streaming so it can
+        // be discounted.
+        _calibrating = true;
+        _calibrate.Stop();
+        _calibrate.Start();
         ShowStatus();
     }
 
     void ShowStatus()
     {
         if (_phase > 1) return;
+        if (_calibrating)
+        {
+            _status.Text = "checking what this machine sends on its own -\r\ndon't touch the screen or keyboard for a moment...";
+            return;
+        }
         var c = Candidates();
-        if (c.Length == 0) { _status.Text = "waiting for a key..."; return; }
+        if (c.Length == 0) { _status.Text = "ready - press your key now"; return; }
 
         var bucket = _phase == 0 ? _phase1 : _phase2;
         _status.Text = "detected: " + _signals[c[0]].Describe() + "   (" + bucket[c[0]] + " presses)";
