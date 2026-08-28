@@ -330,6 +330,12 @@ pinned at 0, Windows' step cannot go lower, and only the overlay changes.
 
 | file | purpose |
 | --- | --- |
-| `BrightnessSteps.cs` | the app |
-| `build.ps1` | rebuild + restart |
-| `keylogger-probe.cs` | throwaway diagnostic that established the three findings above; not needed to run the app |
+| `BrightnessSteps.cs` | the whole app, single file |
+| `build.ps1` | compile and restart |
+| `installer/` | Inno Setup script for the per-user installer |
+| `tools/makeicon.cs` | draws `app.ico` at eight sizes |
+| `tools/publish.ps1` | creates the repo and cuts a release |
+| `site/` | the landing page and its deploy script |
+
+Run `BrightnessSteps.exe --selftest` to drive the key path against a simulated
+Windows step and print the worst drift; see *Testing without a keyboard* above.
