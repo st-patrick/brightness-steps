@@ -1,13 +1,15 @@
 # Creates the public GitHub repo, pushes, and cuts the v1.0.0 release with the
 # installer attached. Run after `gh auth login`.
-$ErrorActionPreference = 'Stop'
+# Native tools report failure through exit codes; PowerShell turning their
+# stderr into terminating errors just aborts on expected probes.
+$ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $gh   = "C:\Program Files\GitHub CLI\gh.exe"
 $repo = "brightness-steps"
 $desc = "Your laptop's brightness keys, with usable steps at the dark end. A small Windows tray app."
 $site = "https://projects.patrickreinbold.com/brightness-steps/"
 
-& $gh auth status 2>&1 | Out-Null
+& $gh auth status | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "not logged in - run: gh auth login" }
 
 $user = (& $gh api user --jq .login).Trim()
@@ -15,16 +17,16 @@ Write-Host "authenticated as: $user"
 
 Set-Location $root
 
-if (& $gh repo view "$user/$repo" 2>$null) {
+& $gh repo view "$user/$repo" | Out-Null
+if ($LASTEXITCODE -eq 0) {
     Write-Host "repo already exists: $user/$repo"
 } else {
     & $gh repo create $repo --public --description $desc --homepage $site --source . --remote origin
     if ($LASTEXITCODE -ne 0) { throw "repo create failed" }
 }
 
-if (-not (git remote get-url origin 2>$null)) {
-    git remote add origin "https://github.com/$user/$repo.git"
-}
+git remote get-url origin | Out-Null
+if ($LASTEXITCODE -ne 0) { git remote add origin "https://github.com/$user/$repo.git" }
 
 git push -u origin master
 if ($LASTEXITCODE -ne 0) { throw "push failed" }
