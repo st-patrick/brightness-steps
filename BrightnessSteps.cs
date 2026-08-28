@@ -403,6 +403,7 @@ class TrayApp : ApplicationContext
 
         m.Items.Add(new ToolStripSeparator());
         m.Items.Add("Set up brightness keys...", null, (s, e) => RunSetup());
+        m.Items.Add("Reset keys to defaults", null, (s, e) => ResetKeys());
         m.Items.Add("Copy compatibility report", null, (s, e) => ShowReport());
         m.Items.Add(new ToolStripSeparator());
         m.Items.Add("Darker", null, (s, e) => Move(-1));
@@ -458,6 +459,18 @@ class TrayApp : ApplicationContext
         RebuildListeners();
         _tray.ShowBalloonTip(5000, "BrightnessSteps",
             "Keys set: " + KeyConfig.Down.Describe() + " / " + KeyConfig.Up.Describe(), ToolTipIcon.Info);
+    }
+
+    /// <summary>
+    /// Undo for a bad setup run. Without this, teaching it the wrong key leaves
+    /// the brightness keys dead with no way back except deleting a file.
+    /// </summary>
+    void ResetKeys()
+    {
+        KeyConfig.Reset();
+        RebuildListeners();
+        _tray.ShowBalloonTip(5000, "BrightnessSteps",
+            "Back to the standard brightness keys.", ToolTipIcon.Info);
     }
 
     /// <summary>Re-reads the key config and re-attaches input. Safe to call repeatedly.</summary>
