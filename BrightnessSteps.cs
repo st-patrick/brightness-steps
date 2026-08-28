@@ -1,4 +1,4 @@
-// BrightnessSteps - finer brightness steps for the keyboard brightness keys.
+﻿// BrightnessSteps - finer brightness steps for the keyboard brightness keys.
 //
 // Windows moves brightness in jumps of 10, which makes the bottom of the range
 // unusable: you can have 0 or 10, never 5. This walks a hand-tuned ladder
@@ -13,14 +13,20 @@
 // is known immediately, along with its direction.
 //
 // Keeping the flicker down: we apply our rung the moment the HID report lands,
-// then hold it. Windows still stomps on it ~20ms later, so a guard loop polls
-// the backlight every millisecond for a short window afterwards and puts it
-// straight back. Both the read and the write go through the display driver
-// directly (IOCTL_VIDEO_*_DISPLAY_BRIGHTNESS, ~0.16ms) rather than WMI (~10ms),
-// which is what makes a ~2ms correction possible at all.
+// then hold it. Windows still stomps on it ~20ms later, so a guard loop watches
+// the backlight for a short window afterwards and puts it straight back. Both
+// the read and the write go through the display driver directly
+// (IOCTL_VIDEO_*_DISPLAY_BRIGHTNESS, ~0.16ms) rather than WMI (~10ms).
+//
+// The driver will not always take the first correction: a write issued while an
+// earlier brightness change is still settling is often dropped outright, and a
+// change takes 3-14ms to settle. So the guard polls (paced, ~100us) and re-issues
+// (rate limited, ~3.3ms) until a read confirms the value. Re-issuing on every
+// poll instead is what saturates the driver and guarantees it never converges.
 using System;
 using System.Drawing;
 using System.Globalization;
+using System.IO;
 using System.Management;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -30,8 +36,18 @@ using Microsoft.Win32;
 static class Program
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
+        // --selftest drives the real key path with a simulated Windows stomp, so
+        // the press/stomp race can be reproduced without a physical keyboard.
+        // It deliberately skips the singleton; stop the running instance first.
+        if (Array.IndexOf(args, "--selftest") >= 0)
+        {
+            Application.EnableVisualStyles();
+            SelfTest.Run();
+            return;
+        }
+
         bool fresh;
         using (var mutex = new Mutex(true, "BrightnessStepsSingleton", out fresh))
         {
@@ -39,6 +55,149 @@ static class Program
             Application.EnableVisualStyles();
             Application.Run(new TrayApp());
         }
+    }
+}
+
+/// <summary>
+/// In-memory trace, off unless asked for. Records only interesting moments -
+/// key presses, guard corrections, driver failures - never the poll loop
+/// itself, which runs thousands of times per press.
+/// </summary>
+static class Trace
+{
+    public static volatile bool On;
+
+    struct Rec { public long T; public string Msg; }
+
+    static readonly System.Collections.Generic.Queue<Rec> Buf = new System.Collections.Generic.Queue<Rec>();
+    static readonly object Lock = new object();
+    static readonly System.Diagnostics.Stopwatch Clock = System.Diagnostics.Stopwatch.StartNew();
+    const int MaxRecords = 40000;
+
+    public static void Log(string msg)
+    {
+        if (!On) return;
+        lock (Lock)
+        {
+            if (Buf.Count >= MaxRecords) Buf.Dequeue();
+            Buf.Enqueue(new Rec { T = Clock.ElapsedTicks, Msg = msg });
+        }
+    }
+
+    public static int Count { get { lock (Lock) return Buf.Count; } }
+
+    public static void Dump(string path)
+    {
+        Rec[] recs;
+        lock (Lock) { recs = Buf.ToArray(); Buf.Clear(); }
+        using (var w = new StreamWriter(path, false))
+        {
+            double freq = System.Diagnostics.Stopwatch.Frequency / 1000.0;
+            double t0 = recs.Length > 0 ? recs[0].T / freq : 0;
+            foreach (var r in recs) w.WriteLine("{0,9:F3} ms  {1}", r.T / freq - t0, r.Msg);
+        }
+    }
+}
+
+/// <summary>
+/// Reproduces the press/stomp race without a keyboard. Raw HID reports cannot
+/// be injected, but the part that matters can be: it drives the app's real key
+/// path and, on a separate device handle, plays Windows' role by adding its
+/// +/-10 about 20ms after each press - the timing measured from the HID stream.
+/// </summary>
+static class SelfTest
+{
+    static void Say(string s)
+    {
+        Console.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, s);
+        Console.Out.Flush();
+    }
+
+    public static void Run()
+    {
+        // Anything that parks forever should still produce a report.
+        var watchdog = new Thread(() =>
+        {
+            Thread.Sleep(45000);
+            Say("WATCHDOG: still running after 45s, dumping and aborting");
+            try { Trace.Dump(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "selftest-trace.txt")); } catch { }
+            Environment.Exit(2);
+        });
+        watchdog.IsBackground = true;
+        watchdog.Start();
+
+        Say("constructing TrayApp");
+        var app = new TrayApp();
+        Say("TrayApp constructed");
+        var windows = new Backlight();          // stands in for Windows' own writes
+        Say("second backlight handle open");
+        string dir = Path.GetDirectoryName(Application.ExecutablePath);
+
+        // The UI thread must keep pumping - presentation is marshalled to it.
+        var worker = new Thread(() =>
+        {
+            try
+            {
+                Say("worker started");
+                foreach (int gap in new[] { 120, 35 })
+                {
+                    Sweep(app, windows, +1, 26, gap, "up");
+                    Sweep(app, windows, -1, 26, gap, "down");
+                }
+            }
+            catch (Exception ex) { Say("worker threw: " + ex); }
+            finally
+            {
+                try { Trace.Dump(Path.Combine(dir, "selftest-trace.txt")); } catch { }
+                Application.Exit();
+            }
+        });
+        worker.IsBackground = true;
+        worker.Start();
+
+        Application.Run();
+        windows.Dispose();
+    }
+
+    static void Sweep(TrayApp app, Backlight windows, int direction, int presses, int gapMs, string label)
+    {
+        // Start from a known end of the ladder.
+        Say(string.Format("sweep {0} @{1}ms: resetting", label, gapMs));
+        for (int i = 0; i < 30; i++) { app.StepForTest(-direction); Thread.Sleep(4); }
+        Say("  reset done, settling");
+        Thread.Sleep(400);
+        Say("  pressing");
+
+        Trace.On = true;
+        Trace.Log(string.Format("=== sweep {0}, {1} presses {2}ms apart ===", label, presses, gapMs));
+
+        int worst = 0;
+        for (int i = 0; i < presses; i++)
+        {
+            app.StepForTest(direction);
+
+            // Windows applies its step ~20ms later, from whatever it finds.
+            int stompDelay = Math.Min(20, gapMs / 2);
+            Thread.Sleep(stompDelay);
+            int cur = windows.Get();
+            int stomped = Math.Max(0, Math.Min(100, cur + direction * 10));
+            windows.Set(stomped);
+
+            Thread.Sleep(Math.Max(1, gapMs - stompDelay));
+
+            int settled = windows.Get();
+            int want = app.CurrentHwForTest;
+            if (settled != want)
+            {
+                int drift = Math.Abs(settled - want);
+                if (drift > worst) worst = drift;
+                Trace.Log(string.Format("DRIFT  after press {0}: hardware {1}, rung wants {2}", i + 1, settled, want));
+            }
+        }
+
+        Trace.Log(string.Format("=== sweep {0} @{1}ms done, worst drift {2} points ===", label, gapMs, worst));
+        Console.WriteLine("sweep {0,-5} gap={1,3}ms   worst drift = {2} points", label, gapMs, worst);
+        Thread.Sleep(300);
     }
 }
 
@@ -170,6 +329,11 @@ class TrayApp : ApplicationContext
         Move(direction);        // on the raw-input thread; act at once, don't wait for Windows
     }
 
+    /// <summary>Same entry point a key press takes. Used by --selftest.</summary>
+    public void StepForTest(int direction) { Move(direction); }
+
+    public int CurrentHwForTest { get { lock (_ladderLock) return Ladder[_index].Hw; } }
+
     void Move(int direction)
     {
         int i;
@@ -189,6 +353,7 @@ class TrayApp : ApplicationContext
         // only needs the target number, so nothing that can block - showing the
         // overlay window, DWM, painting the popup - should sit in front of it.
         // Arming late is what let the occasional stomp through.
+        Trace.Log(string.Format("PRESS  rung {0}  hw={1} alpha={2}", i, s.Hw, s.Alpha));
         Interlocked.Exchange(ref _guardEndsAtTicks, DateTime.UtcNow.AddMilliseconds(GuardMs).Ticks);
         _guard.Hold(s.Hw, GuardMs);
         SetHardware(s.Hw);
@@ -392,6 +557,9 @@ class Backlight : IDisposable
             int level;
             if (TryQuery(out level)) return level;
         }
+        // The WMI path is ~60x slower; if this ever fires mid-press it would
+        // stall the guard long enough for stomps to accumulate.
+        Trace.Log("BACKLIGHT query fell back to WMI");
         return WmiGet();
     }
 
@@ -407,6 +575,7 @@ class Backlight : IDisposable
                 Marshal.WriteByte(_setBuf, 2, (byte)level);
                 uint ret;
                 if (DeviceIoControl(_device, IOCTL_SET_BRIGHTNESS, _setBuf, 3, IntPtr.Zero, 0, out ret, IntPtr.Zero)) return;
+                Trace.Log("BACKLIGHT set ioctl failed err=" + Marshal.GetLastWin32Error());
             }
         }
         WmiSet(level);
@@ -477,6 +646,15 @@ class Guard : IDisposable
     // key is actually down, so the ceiling belongs well outside real use.
     const int MaxContinuousSpinMs = 15000;
 
+    // Poll every ~100us rather than as fast as the CPU allows: detection stays
+    // well under a millisecond, with ~14x less driver traffic.
+    static readonly long PollIntervalTicks = System.Diagnostics.Stopwatch.Frequency / 10000;
+
+    // Minimum gap between corrective writes, so a set in flight gets a chance to
+    // land before the next one is queued behind it. ~3.3ms; measured against
+    // 1.4ms (identical) and 5.9ms (worse), so this sits on a flat optimum.
+    static readonly long SetBackoffTicks = System.Diagnostics.Stopwatch.Frequency / 300;
+
     // The guard gets its OWN device handle rather than sharing the app's. While
     // spinning it takes that handle's lock every fraction of a millisecond, and
     // sharing it would stall the UI thread's own writes behind the spin.
@@ -519,6 +697,9 @@ class Guard : IDisposable
             if (_stop) return;
 
             long startedAt = DateTime.UtcNow.Ticks;
+            long lastSetAt = 0;
+            long nextPoll = System.Diagnostics.Stopwatch.GetTimestamp();
+
             timeBeginPeriod(1);                 // Sleep(1) is ~15ms otherwise
             try
             {
@@ -528,11 +709,38 @@ class Guard : IDisposable
                     if (now >= Interlocked.Read(ref _untilTicks)) break;
 
                     int cur = _backlight.Get();
-                    if (cur != _target) _backlight.Set(_target);
+                    if (cur != _target)
+                    {
+                        // Rate limited. The driver applies brightness serially,
+                        // so re-issuing on every poll (this used to fire every
+                        // ~7us) keeps it permanently busy and the correction
+                        // never lands - the guard was starving the very thing it
+                        // was driving, and Windows' steps piled up behind it.
+                        long stamp = System.Diagnostics.Stopwatch.GetTimestamp();
+                        if (stamp - lastSetAt >= SetBackoffTicks)
+                        {
+                            Trace.Log(string.Format("guard  saw {0}, restoring {1}", cur, _target));
+                            _backlight.Set(_target);
+                            lastSetAt = stamp;
+                        }
+                    }
+                    else lastSetAt = 0;         // settled; next stomp gets an immediate answer
 
                     bool spinBudgetLeft = (now - startedAt) < MaxContinuousSpinMs * TimeSpan.TicksPerMillisecond;
-                    if (now < Interlocked.Read(ref _spinUntilTicks) && spinBudgetLeft) Thread.SpinWait(30);
-                    else Thread.Sleep(1);
+                    if (now < Interlocked.Read(ref _spinUntilTicks) && spinBudgetLeft)
+                    {
+                        // Pace the reads too. Detection stays well under a
+                        // millisecond without flooding the driver with queries.
+                        nextPoll += PollIntervalTicks;
+                        long t = System.Diagnostics.Stopwatch.GetTimestamp();
+                        if (nextPoll < t) nextPoll = t;             // fell behind; don't burst
+                        while (System.Diagnostics.Stopwatch.GetTimestamp() < nextPoll) Thread.SpinWait(20);
+                    }
+                    else
+                    {
+                        Thread.Sleep(1);
+                        nextPoll = System.Diagnostics.Stopwatch.GetTimestamp();
+                    }
                 }
             }
             finally { timeEndPeriod(1); }
@@ -866,3 +1074,6 @@ class Osd
         _hide.Start();
     }
 }
+
+
+

@@ -1,2 +1,3 @@
 *.exe
 probe-log.txt
+selftest-trace.txt

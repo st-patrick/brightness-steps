@@ -136,6 +136,39 @@ reliably as possible:
   came back specifically when holding or pressing fast, and specifically near
   zero where 2 ms is enough to see.
 
+## The driver drops corrections, and the guard must not flood it
+
+The single biggest cause of flicker under fast key presses turned out to be
+self-inflicted. Measured on this panel:
+
+- A brightness change takes **3-14 ms to settle**.
+- A write issued while an earlier change is still settling is **often dropped
+  outright** — a single correction sticks only about 5-8 times out of 8,
+  regardless of how soon after the foreign write it is issued. There is no
+  timing window that reliably wins, so the guard has to re-issue until a read
+  confirms the value.
+- Re-issuing on *every* poll, which is what the guard originally did, fires
+  ~140,000 writes per second. That keeps the driver permanently busy, so the
+  correction never lands at all and Windows' steps pile up on top of each other:
+  `guard saw 92, restoring 82` repeating every 7 microseconds, forever.
+
+So the guard now paces its reads (~100 µs) and rate-limits its writes (~3.3 ms,
+measured flat against 1.4 ms and better than 5.9 ms). Under `--selftest`, worst
+drift at 35 ms between presses went from **33 points to 10**; at 120 ms it is 0.
+
+The remaining 10 points is one uncorrected step still settling at the moment of
+sampling, and it is a property of the display driver rather than of this code.
+
+## Testing without a keyboard
+
+Raw HID reports cannot be injected, so `BrightnessSteps.exe --selftest` drives
+the app's real key path and plays Windows' part on a second device handle,
+adding ±10 about 20 ms after each press. It sweeps the ladder in both directions
+at several press intervals and reports the worst drift between the hardware and
+the rung that should be showing. It skips the singleton, so stop the running
+instance first. `Trace` records presses, corrections and driver fallbacks to
+`selftest-trace.txt`; it is off unless the self-test turns it on.
+
 ## Why the extremes flickered when the middle did not
 
 A 10-point step is a ~10 % change at the top of the range and a ~10x change at
