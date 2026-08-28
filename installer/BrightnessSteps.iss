@@ -1,6 +1,6 @@
-; Per-user install: no UAC prompt, since the app itself never needs elevation.
+﻿; Per-user install: no UAC prompt, since the app itself never needs elevation.
 #define AppName        "BrightnessSteps"
-#define AppVersion     "1.0.0"
+#define AppVersion     "1.1.0"
 #define AppPublisher   "Patrick Reinbold"
 #define AppURL         "https://projects.patrickreinbold.com/brightness-steps/"
 #define AppExe         "BrightnessSteps.exe"
