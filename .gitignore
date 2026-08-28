@@ -1,3 +1,5 @@
 *.exe
 probe-log.txt
 selftest-trace.txt
+dist/
+icon-*.png

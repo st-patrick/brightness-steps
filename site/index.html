@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BrightnessSteps — usable brightness steps at the dark end</title>
+<meta name="description" content="A tiny Windows tray app that gives your laptop's brightness keys fine steps at the low end, and can dim below hardware zero to fully black.">
+<link rel="icon" href="icon.png">
+<meta property="og:title" content="BrightnessSteps">
+<meta property="og:description" content="Your laptop's brightness keys, with usable steps at the dark end.">
+<meta property="og:image" content="icon.png">
+<style>
+  :root{
+    --bg:#0d0f14; --panel:#151922; --line:#232936;
+    --ink:#e8ecf4; --dim:#98a2b6; --gold:#f0c987; --gold-soft:#f7dcae;
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background-image:radial-gradient(900px 500px at 50% -10%, #1c2130 0%, transparent 70%);
+  }
+  .wrap{max-width:760px;margin:0 auto;padding:0 20px}
+  header{text-align:center;padding:72px 20px 40px}
+  header img{width:104px;height:104px;image-rendering:auto}
+  h1{font-size:clamp(2rem,6vw,2.9rem);margin:20px 0 6px;letter-spacing:-.02em}
+  .tag{font-size:clamp(1.05rem,2.6vw,1.25rem);color:var(--gold-soft);margin:0 0 10px}
+  .sub{color:var(--dim);margin:0 auto;max-width:52ch}
+  .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin:32px 0 10px}
+  .btn{
+    display:inline-block;padding:13px 26px;border-radius:11px;text-decoration:none;
+    font-weight:600;border:1px solid transparent;transition:transform .12s ease,background .12s ease;
+  }
+  .btn:hover{transform:translateY(-1px)}
+  .btn-primary{background:var(--gold);color:#20160a}
+  .btn-primary:hover{background:var(--gold-soft)}
+  .btn-ghost{border-color:var(--line);color:var(--ink)}
+  .btn-ghost:hover{background:var(--panel)}
+  .meta{color:var(--dim);font-size:.87rem;margin-top:4px}
+  section{padding:34px 0;border-top:1px solid var(--line)}
+  h2{font-size:1.28rem;margin:0 0 14px;letter-spacing:-.01em}
+  p{margin:0 0 14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px}
+  .scale{margin:0 0 6px}
+  .scale-label{font-size:.8rem;color:var(--dim);text-transform:uppercase;letter-spacing:.09em;margin-bottom:9px}
+  .ticks{display:flex;gap:3px;align-items:flex-end;height:52px;overflow-x:auto;padding-bottom:2px}
+  .tick{flex:1 0 auto;min-width:5px;border-radius:3px 3px 0 0;background:linear-gradient(180deg,var(--gold) 0%,#6b5636 100%)}
+  .legend{font-size:.86rem;color:var(--dim);margin-top:10px}
+  ul{margin:0;padding-left:1.15em;color:var(--dim)}
+  li{margin:7px 0}
+  li b{color:var(--ink);font-weight:600}
+  table{width:100%;border-collapse:collapse;font-size:.93rem}
+  td,th{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.07em}
+  code{background:#1b2230;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:.87em}
+  footer{padding:40px 0 64px;color:var(--dim);font-size:.87rem;text-align:center;border-top:1px solid var(--line)}
+  a{color:var(--gold)}
+  .note{color:var(--dim);font-size:.9rem}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <img src="icon.png" alt="">
+    <h1>BrightnessSteps</h1>
+    <p class="tag">Your laptop's brightness keys, with usable steps at the dark end.</p>
+    <p class="sub">Windows moves brightness in jumps of 10. In a dark room that is the
+      difference between too dark to read and too bright to look at, with nothing in between.</p>
+
+    <div class="cta">
+      <a class="btn btn-primary" href="BrightnessSteps-setup.exe">Download for Windows</a>
+      <a class="btn btn-ghost" href="https://github.com/patrickreinbold/brightness-steps">Source on GitHub</a>
+    </div>
+    <p class="meta">Free and open source · installs per user, no admin prompt · ~2 MB</p>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section>
+    <h2>The difference</h2>
+    <div class="card">
+      <div class="scale">
+        <div class="scale-label">Windows — 11 steps, nothing usable at the bottom</div>
+        <div class="ticks" id="win"></div>
+      </div>
+      <div class="scale" style="margin-top:22px">
+        <div class="scale-label">BrightnessSteps — 26 steps, fine where your eyes need them</div>
+        <div class="ticks" id="ours"></div>
+      </div>
+      <p class="legend">Each bar is one press of the brightness key. Height is the resulting
+        screen brightness — note how many presses land in the dark end.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>What it does</h2>
+    <ul>
+      <li><b>1-point steps at the bottom.</b> 0, 1, 2, 3, 4, 5, 6, then widening to 8, 10, 13, 16&nbsp;… so every press is about the same <em>relative</em> change.</li>
+      <li><b>Goes below hardware zero.</b> Most laptop panels bottom out still too bright for a dark room. The last few steps dim further, down to fully black.</li>
+      <li><b>Stays out of the way.</b> Tray icon, no window, no background service, no telemetry. It follows the Windows slider rather than fighting it.</li>
+      <li><b>Costs nothing while idle.</b> Measured at 0.000&nbsp;s of CPU between key presses.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Will it work on your laptop?</h2>
+    <p>Probably, if it is a Windows laptop with brightness keys. Nothing is specific to a
+      vendor, model, or keyboard layout — keys are matched on the standard HID brightness
+      usages and decoded through each device's own report descriptor, not by key positions
+      or the <code>Fn</code> state.</p>
+    <table>
+      <tr><th>Needs</th><th>If it is missing</th></tr>
+      <tr><td>A built-in panel that accepts brightness commands</td><td>The tray icon tells you on startup</td></tr>
+      <tr><td>Brightness keys that reach Windows as HID usages</td><td>Keys do nothing; the tray menu still works</td></tr>
+    </table>
+    <p class="note" style="margin-top:16px"><b style="color:var(--ink)">External monitors are not supported.</b>
+      Those need DDC/CI over the video cable — a different mechanism. This drives built-in
+      laptop panels through the display driver.</p>
+    <p class="note">If it does not work for you, the tray menu has <b style="color:var(--ink)">Copy compatibility
+      report</b>: your Windows version, machine model, which method was found, and whether any
+      keys were seen. Nothing personal, and nothing is ever sent on its own — it opens the report
+      so you can read it first.</p>
+  </section>
+
+  <section>
+    <h2>Built by measuring</h2>
+    <p>Almost every decision in this app was forced by a measurement that contradicted the
+      obvious approach. The brightness keys turned out to be invisible to a keyboard hook,
+      the documented API for setting brightness is 60× slower than the one underneath it,
+      and the guard loop that keeps the value in place was — for a while — the very thing
+      preventing it from landing.</p>
+    <p>The <a href="https://github.com/patrickreinbold/brightness-steps#how-it-works-and-what-it-cost-to-get-there">full engineering log</a>
+      is in the repository: what was tried, what was rejected, and the numbers behind each.</p>
+  </section>
+
+</div>
+
+<footer>
+  <div class="wrap">
+    MIT licensed · built and measured on a Surface Book 3 ·
+    reports from other machines are the most useful thing you can contribute
+  </div>
+</footer>
+
+<script>
+  // Bars are drawn from the real ladders so the picture cannot drift from the app.
+  var windowsSteps = [0,10,20,30,40,50,60,70,80,90,100];
+  var ourSteps = [0,0.4,0.9,1.6,2.4,3.4,0,1,2,3,4,5,6,8,10,13,16,20,25,30,37,45,55,67,82,100];
+
+  function draw(id, values, max) {
+    var el = document.getElementById(id);
+    values.forEach(function (v) {
+      var d = document.createElement('div');
+      d.className = 'tick';
+      var h = Math.max(3, (v / max) * 100);
+      d.style.height = h + '%';
+      // Darker bars for the dimmer steps, so the gradient reads at a glance.
+      var lum = 0.25 + 0.75 * (v / max);
+      d.style.background = 'linear-gradient(180deg, rgba(240,201,135,' + lum.toFixed(2) + ') 0%, rgba(240,201,135,' + (lum * 0.35).toFixed(2) + ') 100%)';
+      el.appendChild(d);
+    });
+  }
+  draw('win', windowsSteps, 100);
+  draw('ours', ourSteps, 100);
+</script>
+
+</body>
+</html>

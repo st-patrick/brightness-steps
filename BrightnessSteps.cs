@@ -29,6 +29,7 @@ using System.Globalization;
 using System.IO;
 using System.Management;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -55,6 +56,69 @@ static class Program
             Application.EnableVisualStyles();
             Application.Run(new TrayApp());
         }
+    }
+}
+
+/// <summary>
+/// What this machine actually looks like to the app. Exists so someone whose
+/// laptop it does not work on can send back something useful in one click,
+/// rather than "it does nothing". Purely local - nothing is transmitted.
+/// </summary>
+static class Diagnostics
+{
+    public static int HidDevicesSeen;
+    public static int HidDevicesWithoutDescriptor;
+    public static int KeyPressesSeen;
+    public static int DecodedByDescriptor;
+    public static int DecodedByFallbackLayout;
+    public static bool RawInputRegistered;
+    public static string BacklightMethod = "none";
+    public static string BacklightDevice = "";
+    public static int SupportedLevels = -1;
+
+    public static string Report()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("BrightnessSteps - compatibility report");
+        sb.AppendLine("generated " + DateTime.Now.ToString("yyyy-MM-dd HH:mm"));
+        sb.AppendLine();
+
+        sb.AppendLine("[system]");
+        sb.AppendLine("  windows       : " + Environment.OSVersion.Version + " (" + (IntPtr.Size == 8 ? "x64" : "x86") + ")");
+        try
+        {
+            foreach (ManagementObject o in new ManagementObjectSearcher("SELECT Manufacturer, Model FROM Win32_ComputerSystem").Get())
+            { sb.AppendLine("  machine       : " + o["Manufacturer"] + " " + o["Model"]); break; }
+        }
+        catch { sb.AppendLine("  machine       : (unavailable)"); }
+        sb.AppendLine();
+
+        sb.AppendLine("[brightness control]");
+        sb.AppendLine("  method        : " + BacklightMethod);
+        sb.AppendLine("  device        : " + (BacklightDevice == "" ? "(none)" : BacklightDevice));
+        sb.AppendLine("  levels        : " + (SupportedLevels < 0 ? "unknown" : SupportedLevels.ToString()));
+        sb.AppendLine();
+
+        sb.AppendLine("[brightness keys]");
+        sb.AppendLine("  raw input     : " + (RawInputRegistered ? "registered" : "NOT REGISTERED"));
+        sb.AppendLine("  key presses   : " + KeyPressesSeen);
+        sb.AppendLine("  hid devices   : " + HidDevicesSeen + " (" + HidDevicesWithoutDescriptor + " without a usable descriptor)");
+        sb.AppendLine("  decoded via   : " + DecodedByDescriptor + " descriptor, " + DecodedByFallbackLayout + " fallback layout");
+        sb.AppendLine();
+
+        sb.AppendLine("[what this means]");
+        if (BacklightMethod == "none")
+            sb.AppendLine("  No panel accepted brightness commands. Likely a desktop, or an external");
+        else if (KeyPressesSeen == 0)
+            sb.AppendLine("  Brightness control works, but no brightness key was ever seen. The keys");
+        else
+            sb.AppendLine("  Both halves are working on this machine.");
+        if (BacklightMethod == "none")
+            sb.AppendLine("  monitor only - this tool drives built-in laptop panels.");
+        else if (KeyPressesSeen == 0)
+            sb.AppendLine("  may be handled in firmware and never reach Windows on this model.");
+
+        return sb.ToString();
     }
 }
 
@@ -247,6 +311,7 @@ class TrayApp : ApplicationContext
     readonly object _ladderLock = new object();
     int _index;
     volatile int _desiredHw = -1;       // the hardware value the current rung asks for
+    readonly bool _panelAvailable;
     long _guardEndsAtTicks;
     volatile bool _showOsd = true;
 
@@ -257,16 +322,24 @@ class TrayApp : ApplicationContext
 
         _guard = new Guard();
         int hw = _backlight.Get();
+        _panelAvailable = hw >= 0;
+        if (!_panelAvailable) hw = 50;
         _desiredHw = hw;
         _index = IndexForHardware(hw);
 
         _tray = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
-            Text = "BrightnessSteps",
+            Icon = LoadAppIcon(),
+            Text = _panelAvailable ? "BrightnessSteps" : "BrightnessSteps - no adjustable display found",
             Visible = true,
             ContextMenuStrip = BuildMenu(),
         };
+
+        if (!_panelAvailable)
+            _tray.ShowBalloonTip(10000, "BrightnessSteps",
+                "No adjustable display found. This tool drives built-in laptop panels; " +
+                "external monitors are not supported. Use \"Copy compatibility report\" to report this.",
+                ToolTipIcon.Warning);
 
         _raw = new RawInputListener();
         _raw.BrightnessKey += OnBrightnessKey;
@@ -289,6 +362,8 @@ class TrayApp : ApplicationContext
         m.Items.Add(osd);
 
         m.Items.Add(new ToolStripSeparator());
+        m.Items.Add("Copy compatibility report", null, (s, e) => ShowReport());
+        m.Items.Add(new ToolStripSeparator());
         m.Items.Add("Darker", null, (s, e) => Move(-1));
         m.Items.Add("Brighter", null, (s, e) => Move(+1));
         m.Items.Add(new ToolStripSeparator());
@@ -310,6 +385,34 @@ class TrayApp : ApplicationContext
             if (on) k.SetValue(RunValue, "\"" + Application.ExecutablePath + "\"");
             else k.DeleteValue(RunValue, false);
         }
+    }
+
+    /// <summary>
+    /// One click to get something reportable. Written locally and opened for the
+    /// user to read first - nothing leaves the machine on its own.
+    /// </summary>
+    void ShowReport()
+    {
+        string text = Diagnostics.Report();
+        try { Clipboard.SetText(text); } catch { }
+        try
+        {
+            string path = Path.Combine(Path.GetTempPath(), "brightnesssteps-report.txt");
+            File.WriteAllText(path, text);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch { MessageBox.Show(text, "BrightnessSteps"); }
+    }
+
+    static Icon LoadAppIcon()
+    {
+        try
+        {
+            string ico = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "app.ico");
+            if (File.Exists(ico)) return new Icon(ico);
+            return Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+        }
+        catch { return SystemIcons.Application; }
     }
 
     void Shutdown()
@@ -491,6 +594,7 @@ class Backlight : IDisposable
 
     readonly object _lock = new object();
     IntPtr _device = (IntPtr)(-1);
+    string _devicePath = "";
     byte _policy = DISPLAYPOLICY_AC;
     ManagementObject _wmiMethods;
 
@@ -499,9 +603,42 @@ class Backlight : IDisposable
     readonly IntPtr _queryBuf = Marshal.AllocHGlobal(3);
     readonly IntPtr _setBuf = Marshal.AllocHGlobal(3);
 
-    public Backlight() { Open(); }
+    public Backlight()
+    {
+        Open();
+        if (Diagnostics.BacklightMethod == "none") RecordDiagnostics();
+    }
 
     public bool UsingFastPath { get { return _device != (IntPtr)(-1); } }
+
+    /// <summary>True if this machine has a panel we can actually drive.</summary>
+    public bool Available { get { return UsingFastPath || WmiGet() >= 0; } }
+
+    void RecordDiagnostics()
+    {
+        if (UsingFastPath)
+        {
+            Diagnostics.BacklightMethod = "display driver ioctl";
+            Diagnostics.BacklightDevice = _devicePath;
+        }
+        else if (WmiGet() >= 0)
+        {
+            Diagnostics.BacklightMethod = "wmi";
+            Diagnostics.BacklightDevice = "(wmi)";
+        }
+
+        try
+        {
+            foreach (ManagementObject o in new ManagementObjectSearcher(
+                new ManagementScope(@"root\WMI"), new SelectQuery("WmiMonitorBrightness")).Get())
+            {
+                var levels = o["Level"] as byte[];
+                if (levels != null) Diagnostics.SupportedLevels = levels.Length;
+                break;
+            }
+        }
+        catch { }
+    }
 
     void Open()
     {
@@ -529,7 +666,7 @@ class Backlight : IDisposable
 
                     int probe;
                     _device = h;
-                    if (TryQuery(out probe)) return;      // usable panel, keep it
+                    if (TryQuery(out probe)) { _devicePath = path; return; }   // usable panel, keep it
                     _device = (IntPtr)(-1);
                     CloseHandle(h);
                 }
@@ -592,7 +729,7 @@ class Backlight : IDisposable
                 return Convert.ToInt32(o["CurrentBrightness"]);
         }
         catch { }
-        return 50;
+        return -1;                  // no panel answered; callers treat <0 as unavailable
     }
 
     void WmiSet(int level)
@@ -709,7 +846,7 @@ class Guard : IDisposable
                     if (now >= Interlocked.Read(ref _untilTicks)) break;
 
                     int cur = _backlight.Get();
-                    if (cur != _target)
+                    if (cur >= 0 && cur != _target)
                     {
                         // Rate limited. The driver applies brightness serially,
                         // so re-issuing on every poll (this used to fire every
@@ -788,8 +925,16 @@ class RawInputListener : IDisposable
     [StructLayout(LayoutKind.Sequential)]
     struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public int ptX, ptY; }
 
+    const uint RIDI_PREPARSEDDATA = 0x20000005;
+    const int HIDP_INPUT = 0;
+    const int HIDP_STATUS_SUCCESS = 0x00110000;
+
     [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] d, uint num, uint size);
     [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr hRawInput, uint cmd, IntPtr data, ref uint size, uint hdrSize);
+    [DllImport("user32.dll", SetLastError = true)] static extern uint GetRawInputDeviceInfoW(IntPtr hDevice, uint cmd, IntPtr data, ref uint size);
+    [DllImport("hid.dll")] static extern int HidP_GetUsages(int reportType, ushort usagePage, ushort linkCollection,
+        [In, Out] ushort[] usageList, ref uint usageLength, IntPtr preparsed, IntPtr report, uint reportLength);
+    [DllImport("hid.dll")] static extern int HidP_MaxUsageListLength(int reportType, ushort usagePage, IntPtr preparsed);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetMessageW(out MSG m, IntPtr h, uint min, uint max);
     [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG m);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr DispatchMessageW(ref MSG m);
@@ -853,7 +998,8 @@ class RawInputListener : IDisposable
                     hwndTarget = Handle,
                 },
             };
-            RegisterRawInputDevices(devs, (uint)devs.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+            Diagnostics.RawInputRegistered =
+                RegisterRawInputDevices(devs, (uint)devs.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
         }
 
         protected override void WndProc(ref Message m)
@@ -879,25 +1025,97 @@ class RawInputListener : IDisposable
             int data = (int)hdrSize + 8;
             if (sizeHid < 3) return;
 
+            IntPtr hDevice = Marshal.ReadIntPtr(buf, 8);        // RAWINPUTHEADER.hDevice
+            IntPtr preparsed = _owner.PreparsedFor(hDevice);
+
             for (int r = 0; r < count; r++)
             {
                 int off = data + r * sizeHid;
-                if (off + 3 > size) break;
-                // byte 0 is the report id; the pressed usage follows as 16-bit LE.
-                int usage = Marshal.ReadByte(buf, off + 1) | (Marshal.ReadByte(buf, off + 2) << 8);
+                if (off + sizeHid > size) break;
+                IntPtr report = (IntPtr)(buf.ToInt64() + off);
 
-                int dir = usage == USAGE_BRIGHTNESS_UP ? +1 : usage == USAGE_BRIGHTNESS_DOWN ? -1 : 0;
-                if (dir != 0) _owner.Raise(dir);
+                int dir;
+                if (preparsed != IntPtr.Zero)
+                {
+                    dir = DecodeWithHid(preparsed, report, (uint)sizeHid);
+                    if (dir != 0) Diagnostics.DecodedByDescriptor++;
+                }
+                else
+                {
+                    dir = DecodeByLayout(buf, off, sizeHid, (int)size);
+                    if (dir != 0) Diagnostics.DecodedByFallbackLayout++;
+                }
+
+                if (dir != 0) { Diagnostics.KeyPressesSeen++; _owner.Raise(dir); }
             }
         }
         finally { Marshal.FreeHGlobal(buf); }
         }
+
+        /// <summary>
+        /// Decodes a report the way the device's own descriptor says to, rather
+        /// than assuming a byte layout. Consumer-control reports differ between
+        /// vendors - some send a 16-bit usage, some a bitmap, with varying report
+        /// ids and padding - so this is what makes the app work on machines other
+        /// than the one it was written on.
+        /// </summary>
+        static int DecodeWithHid(IntPtr preparsed, IntPtr report, uint reportLength)
+        {
+            int max = HidP_MaxUsageListLength(HIDP_INPUT, USAGE_PAGE_CONSUMER, preparsed);
+            if (max <= 0) return 0;
+
+            var usages = new ushort[max];
+            uint len = (uint)max;
+            if (HidP_GetUsages(HIDP_INPUT, USAGE_PAGE_CONSUMER, 0, usages, ref len, preparsed, report, reportLength) != HIDP_STATUS_SUCCESS)
+                return 0;
+
+            for (int i = 0; i < len; i++)
+            {
+                if (usages[i] == USAGE_BRIGHTNESS_UP) return +1;
+                if (usages[i] == USAGE_BRIGHTNESS_DOWN) return -1;
+            }
+            return 0;
+        }
+
+        /// <summary>Fallback for the common "report id then 16-bit usage" layout.</summary>
+        static int DecodeByLayout(IntPtr buf, int off, int sizeHid, int size)
+        {
+            if (sizeHid < 3 || off + 3 > size) return 0;
+            int usage = Marshal.ReadByte(buf, off + 1) | (Marshal.ReadByte(buf, off + 2) << 8);
+            return usage == USAGE_BRIGHTNESS_UP ? +1 : usage == USAGE_BRIGHTNESS_DOWN ? -1 : 0;
+        }
+    }
+
+    // One preparsed descriptor per device, kept for the life of the listener.
+    readonly System.Collections.Generic.Dictionary<IntPtr, IntPtr> _preparsed =
+        new System.Collections.Generic.Dictionary<IntPtr, IntPtr>();
+
+    internal IntPtr PreparsedFor(IntPtr hDevice)
+    {
+        IntPtr pp;
+        if (_preparsed.TryGetValue(hDevice, out pp)) return pp;
+
+        pp = IntPtr.Zero;
+        uint size = 0;
+        if (GetRawInputDeviceInfoW(hDevice, RIDI_PREPARSEDDATA, IntPtr.Zero, ref size) == 0 && size > 0)
+        {
+            IntPtr buf = Marshal.AllocHGlobal((int)size);
+            if (GetRawInputDeviceInfoW(hDevice, RIDI_PREPARSEDDATA, buf, ref size) != unchecked((uint)-1)) pp = buf;
+            else Marshal.FreeHGlobal(buf);
+        }
+
+        _preparsed[hDevice] = pp;       // cache the failure too; do not retry per report
+        Diagnostics.HidDevicesSeen++;
+        if (pp == IntPtr.Zero) Diagnostics.HidDevicesWithoutDescriptor++;
+        return pp;
     }
 
     public void Dispose()
     {
         if (_threadId != 0) PostThreadMessageW(_threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
         _thread.Join(1000);
+        foreach (var pp in _preparsed.Values) if (pp != IntPtr.Zero) Marshal.FreeHGlobal(pp);
+        _preparsed.Clear();
     }
 }
 

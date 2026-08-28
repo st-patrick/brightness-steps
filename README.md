@@ -1,10 +1,73 @@
-# BrightnessSteps
+<p align="center">
+  <img src="docs/icon.png" width="96" height="96" alt="">
+</p>
 
-Finer brightness steps for the keyboard brightness keys on a Surface Book 3.
+<h1 align="center">BrightnessSteps</h1>
 
-Windows moves brightness in jumps of 10, so the bottom of the range is unusable:
-you can have 0 or 10, never 5. This replaces each key press with a step along a
-hand-tuned ladder, and adds a few rungs *below* hardware zero.
+<p align="center">
+  <b>Your laptop's brightness keys, with usable steps at the dark end.</b><br>
+  A single small tray app for Windows. No admin, no background service, no telemetry.
+</p>
+
+---
+
+Windows moves screen brightness in jumps of 10. At the bottom of the range that
+is the difference between "too dark to read" and "too bright for a dark room",
+with nothing in between:
+
+```
+Windows      0 ─────────── 10 ─────────── 20 ─────────── 30 ...
+             ^ nothing usable lives in here ^
+
+BrightnessSteps
+             0  1  2  3  4  5  6  8  10  13  16  20  25  30  37 ...
+             ^ 1-point steps where your eyes need them ^
+```
+
+It also goes **below** hardware zero. Most laptop panels stop at a backlight
+level that is still too bright in a properly dark room, so the last few steps
+dim the screen further, down to fully black.
+
+## Install
+
+Download the installer from [Releases](../../releases), or grab
+`BrightnessSteps.exe` and run it — it is a single self-contained executable.
+
+- Installs per user, so there is **no UAC prompt**
+- Needs .NET Framework 4.x, which ships with Windows 8 and later
+- Optional "start when I sign in", toggleable later from the tray menu
+
+Building from source needs nothing but Windows: `build.ps1` compiles with the
+`csc.exe` already in `C:\Windows\Microsoft.NET`.
+
+## Will it work on my laptop?
+
+Probably, if it is a Windows laptop with brightness keys. Nothing in it is
+specific to a vendor, model or keyboard layout — keys are matched on the
+standard HID Consumer Page usages `0x6F`/`0x70` (Display Brightness
+Increment/Decrement), decoded through the device's own HID report descriptor,
+not by scancodes, key positions, or the `Fn` state.
+
+Two things have to be true, and the app tells you if they are not:
+
+| requirement | if it is missing |
+| --- | --- |
+| A built-in panel that accepts brightness commands | Tray icon says so on startup |
+| Brightness keys that reach Windows as HID consumer usages | Keys do nothing; the ladder still works from the tray menu |
+
+**It will not work with external monitors.** Those need DDC/CI over the video
+cable, which is a different mechanism entirely; this drives built-in laptop
+panels through the display driver.
+
+If it does not work for you, right-click the tray icon and choose **Copy
+compatibility report**. That collects your Windows version, machine model,
+which brightness method was found, and whether any keys were seen — nothing
+else, nothing personal — puts it on the clipboard and opens it so you can read
+it before sending. Paste it into an
+[issue](../../issues). Nothing is ever transmitted on its own.
+
+Developed and measured on a Surface Book 3. Reports from other machines are
+the most useful thing you can contribute.
 
 ## The ladder
 
@@ -15,16 +78,24 @@ hand-tuned ladder, and adds a few rungs *below* hardware zero.
 | below hardware zero (black overlay) | black (fully dark) / dim 91% / 80% / 67% / 47% / 24% |
 | hardware brightness | `0 1 2 3 4 5 6 8 10 13 16 20 25 30 37 45 55 67 82 100` |
 
+1-point steps up to 6, then gradually wider, so every press is about the same
+*relative* change rather than the same absolute one. To change it, edit the
+`Ladder` array in `BrightnessSteps.cs` and run `build.ps1`.
+
 The darkest rung is a fully opaque black sheet — the screen goes completely
 dark. Brightness-up still works from there, the level popup draws *above* the
 sheet so there is always something visible, and the sheet belongs to this
 process, so killing it (or Ctrl+Alt+Del, which switches to the secure desktop)
 always gets the screen back.
 
-1-point steps up to 6, then gradually wider, so every press is about the same
-*relative* change rather than the same absolute one.
+---
 
-To change it, edit the `Ladder` array in `BrightnessSteps.cs` and run `build.ps1`.
+# How it works, and what it cost to get there
+
+The rest of this file is the engineering log: what was measured, what was
+tried and rejected, and why the code looks the way it does. It is here because
+almost every interesting decision in this app was forced by a measurement that
+contradicted the obvious approach.
 
 ## How it works
 
@@ -45,8 +116,8 @@ Three things were measured on this machine before the design was fixed:
 
 Given that, each press works as: apply our rung the instant the HID report
 arrives, then *hold* it. Windows still stomps on it ~20 ms later, so a guard
-loop polls the backlight every millisecond for 220 ms afterwards and puts the
-value straight back.
+loop watches the backlight for 220 ms afterwards and puts the value straight
+back (see the driver section below for how often it is safe to do that).
 
 External brightness changes with no preceding key press — the slider, battery
 saver, adaptive brightness — are followed rather than fought, and clear the
