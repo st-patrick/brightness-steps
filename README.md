@@ -184,12 +184,34 @@ prompt on every boot and buy nothing. The only remaining way to truly block the
 key is a kernel-mode HID filter driver, which needs test-signing or an EV
 certificate — far past what this is worth.
 
-One thing admin *could* enable, if the overlay ever becomes a nuisance:
+### The one admin-gated change worth making: lifting the gamma clamp
+
+By default Windows only permits mild gamma dimming. Measured on this machine,
+before any change:
+
+| requested | result |
+| --- | --- |
+| 60 % | applied |
+| 30 %, 10 %, 2 %, 0 % | `SetDeviceGammaRamp` returns false, ramp ignored |
+
+That is why below-zero dimming uses a layered black window. Setting
 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM\GdiIcmGammaRange = 256`
-(admin + reboot) lifts the gamma clamp, which would allow below-zero dimming via
-a gamma ramp instead of a layered window — no sheet in screenshots or over
-fullscreen apps. It would **not** reduce flicker, since that is about backlight
-writes, and gamma can be reset by other colour-management software.
+(admin, then a reboot) lifts the clamp, which would allow gamma dimming instead
+— nothing in screenshots or screen shares, nothing sitting on top of fullscreen
+apps, and none of the window-management bugs the overlay caused.
+
+It would **not** reduce flicker, which is about backlight writes, and gamma can
+be reset by other colour-management software, so the overlay stays as the
+fallback either way.
+
+**This key has been set on this machine.** To undo it, run elevated:
+
+```powershell
+Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM' `
+                    -Name GdiIcmGammaRange
+```
+
+then reboot. That restores the Windows default; nothing else depends on it.
 
 ## Testing without a keyboard
 
