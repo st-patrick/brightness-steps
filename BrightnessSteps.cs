@@ -82,11 +82,15 @@ class TrayApp : ApplicationContext
     readonly Guard _guard;
     RawInputListener _raw;
 
+    // Key presses arrive on the raw-input thread; the menu and the slider
+    // watcher run on the UI thread. Everything shared between them is either
+    // under _ladderLock or interlocked.
+    readonly object _ladderLock = new object();
     int _index;
-    int _lastSelfSet = -1;
-    DateTime _lastSelfSetAt = DateTime.MinValue;
-    DateTime _guardEndsAt = DateTime.MinValue;
-    bool _showOsd = true;
+    volatile int _lastSelfSet = -1;
+    long _lastSelfSetAtTicks;
+    long _guardEndsAtTicks;
+    volatile bool _showOsd = true;
 
     public TrayApp()
     {
@@ -162,40 +166,47 @@ class TrayApp : ApplicationContext
 
     void OnBrightnessKey(int direction)
     {
-        Move(direction);        // arrives on this thread; act at once, don't wait for Windows
+        Move(direction);        // on the raw-input thread; act at once, don't wait for Windows
     }
 
     void Move(int direction)
     {
-        ApplyIndex(Math.Max(0, Math.Min(Ladder.Length - 1, _index + direction)));
+        int i;
+        Step s;
+        lock (_ladderLock)
+        {
+            i = Math.Max(0, Math.Min(Ladder.Length - 1, _index + direction));
+            _index = i;
+            s = Ladder[i];
+        }
+        ApplyStep(i, s);
     }
 
-    void ApplyIndex(int i)
+    void ApplyStep(int i, Step s)
     {
-        _index = i;
-        Step s = Ladder[i];
-
         // Arm the guard FIRST. Windows' stomp is coming in ~20ms and the guard
         // only needs the target number, so nothing that can block - showing the
         // overlay window, DWM, painting the popup - should sit in front of it.
         // Arming late is what let the occasional stomp through.
-        _guardEndsAt = DateTime.UtcNow.AddMilliseconds(GuardMs);
+        Interlocked.Exchange(ref _guardEndsAtTicks, DateTime.UtcNow.AddMilliseconds(GuardMs).Ticks);
         _guard.Hold(s.Hw, GuardMs);
+        SetHardware(s.Hw);
 
-        // Raise hardware before lifting the overlay, and drop the overlay before
-        // lowering hardware - otherwise the step flashes bright for a frame.
-        if (s.Alpha == 0)
-        {
-            SetHardware(s.Hw);
-            _overlay.Apply(0);
-        }
-        else
+        // Everything below is presentation and must not sit in the key path, so
+        // it is handed to the UI thread. Ordering between hardware and overlay
+        // does not matter here because every overlay rung sits at hardware 0,
+        // and so does its neighbour - the two never change in the same step.
+        Action present = () =>
         {
             _overlay.Apply(s.Alpha);
-            SetHardware(s.Hw);
-        }
+            if (_showOsd) _osd.Show(i, Ladder.Length, DescribeStep(s));
+        };
 
-        if (_showOsd) _osd.Show(i, Ladder.Length, DescribeStep(s));
+        if (_sync.InvokeRequired)
+        {
+            try { _sync.BeginInvoke(present); } catch { }
+        }
+        else present();
     }
 
     static string DescribeStep(Step s)
@@ -221,7 +232,7 @@ class TrayApp : ApplicationContext
     void SetHardware(int level)
     {
         _lastSelfSet = level;
-        _lastSelfSetAt = DateTime.UtcNow;
+        Interlocked.Exchange(ref _lastSelfSetAtTicks, DateTime.UtcNow.Ticks);
         _backlight.Set(level);
     }
 
@@ -245,18 +256,18 @@ class TrayApp : ApplicationContext
 
     void OnExternalBrightness(int hw)
     {
-        var now = DateTime.UtcNow;
+        long now = DateTime.UtcNow.Ticks;
 
         // While the guard is running we own the backlight; the events arriving
         // are Windows' stomp and our corrections racing each other.
-        if (now < _guardEndsAt.AddMilliseconds(250)) return;
+        if (now < Interlocked.Read(ref _guardEndsAtTicks) + 250 * TimeSpan.TicksPerMillisecond) return;
 
         // Our own write echoing back.
-        if (hw == _lastSelfSet && (now - _lastSelfSetAt).TotalMilliseconds < 2500) return;
+        if (hw == _lastSelfSet && now - Interlocked.Read(ref _lastSelfSetAtTicks) < 2500 * TimeSpan.TicksPerMillisecond) return;
 
         // Nobody pressed a key, so this is the slider (or battery saver, or
         // adaptive brightness) moving things. Follow it rather than fight it.
-        _index = IndexForHardware(hw);
+        lock (_ladderLock) { _index = IndexForHardware(hw); }
         if (_overlay.Alpha != 0) _overlay.Apply(0);
     }
 }
@@ -445,10 +456,13 @@ class Guard : IDisposable
     // to cheap sleep-polling for the long tail.
     const int SpinMs = 70;
 
-    // Holding a brightness key repeats, and each repeat re-arms the spin. Stop
-    // spinning if that goes on unreasonably long, so a stuck key cannot pin a
-    // core indefinitely.
-    const int MaxContinuousSpinMs = 3000;
+    // Purely a stuck-key backstop. This used to be 3s, which a normal hold from
+    // full brightness down to black comfortably exceeds: the loop never exits
+    // while repeats keep extending it, so the guard silently dropped to ~2ms
+    // latency mid-hold and the flicker came back exactly where it hurts most.
+    // Spinning costs one logical core (~12% of this machine) and only while a
+    // key is actually down, so the ceiling belongs well outside real use.
+    const int MaxContinuousSpinMs = 15000;
 
     // The guard gets its OWN device handle rather than sharing the app's. While
     // spinning it takes that handle's lock every fraction of a millisecond, and
@@ -526,13 +540,20 @@ class Guard : IDisposable
 }
 
 /// <summary>
-/// Message-only window that listens for raw HID consumer-control reports and
-/// reports brightness key presses. Raw input can observe these keys but cannot
-/// block them, which is fine - we only need to know direction and timing.
+/// Listens for raw HID consumer-control reports and reports brightness key
+/// presses. Raw input can observe these keys but cannot block them, which is
+/// fine - we only need to know direction and timing.
+///
+/// It runs on its own thread with its own message loop. On the UI thread,
+/// WM_INPUT would queue behind the overlay's animation ticks and the popup's
+/// painting - which is precisely what is happening when keys are held or
+/// pressed quickly in the dim region, so the guard got armed late exactly when
+/// presses came fastest.
 /// </summary>
-class RawInputListener : NativeWindow, IDisposable
+class RawInputListener : IDisposable
 {
     const int WM_INPUT = 0x00FF;
+    const int WM_QUIT = 0x0012;
     const int RIDEV_INPUTSINK = 0x00000100;
     const uint RID_INPUT = 0x10000003;
     const ushort USAGE_PAGE_CONSUMER = 0x0C;
@@ -543,36 +564,85 @@ class RawInputListener : NativeWindow, IDisposable
     [StructLayout(LayoutKind.Sequential)]
     struct RAWINPUTDEVICE { public ushort UsagePage, Usage; public int Flags; public IntPtr hwndTarget; }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public int ptX, ptY; }
+
     [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] d, uint num, uint size);
     [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr hRawInput, uint cmd, IntPtr data, ref uint size, uint hdrSize);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetMessageW(out MSG m, IntPtr h, uint min, uint max);
+    [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG m);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr DispatchMessageW(ref MSG m);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PostThreadMessageW(uint tid, uint msg, IntPtr w, IntPtr l);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
 
+    /// <summary>Raised on the listener's own thread, not the UI thread.</summary>
     public event Action<int> BrightnessKey;
+
+    readonly Thread _thread;
+    readonly ManualResetEventSlim _ready = new ManualResetEventSlim(false);
+    Sink _sink;
+    uint _threadId;
 
     public RawInputListener()
     {
-        CreateHandle(new CreateParams { Parent = (IntPtr)(-3) });   // HWND_MESSAGE
-
-        var devs = new[]
+        _thread = new Thread(Pump)
         {
-            new RAWINPUTDEVICE
-            {
-                UsagePage = USAGE_PAGE_CONSUMER,
-                Usage = USAGE_CONSUMER_CONTROL,
-                Flags = RIDEV_INPUTSINK,        // deliver even when we have no focus
-                hwndTarget = Handle,
-            },
+            IsBackground = true,
+            Name = "brightness-input",
+            Priority = ThreadPriority.AboveNormal,
         };
-        RegisterRawInputDevices(devs, (uint)devs.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+        _thread.SetApartmentState(ApartmentState.STA);
+        _thread.Start();
+        _ready.Wait(3000);
     }
 
-    protected override void WndProc(ref Message m)
+    void Pump()
     {
-        if (m.Msg == WM_INPUT) Handle_WM_INPUT(m.LParam);
-        base.WndProc(ref m);
+        _threadId = GetCurrentThreadId();
+        _sink = new Sink(this);
+        _ready.Set();
+
+        MSG m;
+        while (GetMessageW(out m, IntPtr.Zero, 0, 0) > 0) { TranslateMessage(ref m); DispatchMessageW(ref m); }
     }
 
-    void Handle_WM_INPUT(IntPtr hRawInput)
+    void Raise(int direction)
     {
+        var h = BrightnessKey;
+        if (h != null) h(direction);
+    }
+
+    /// <summary>The message-only window, created on and pumped by the listener thread.</summary>
+    class Sink : NativeWindow
+    {
+        readonly RawInputListener _owner;
+
+        public Sink(RawInputListener owner)
+        {
+            _owner = owner;
+            CreateHandle(new CreateParams { Parent = (IntPtr)(-3) });   // HWND_MESSAGE
+
+            var devs = new[]
+            {
+                new RAWINPUTDEVICE
+                {
+                    UsagePage = USAGE_PAGE_CONSUMER,
+                    Usage = USAGE_CONSUMER_CONTROL,
+                    Flags = RIDEV_INPUTSINK,        // deliver even when we have no focus
+                    hwndTarget = Handle,
+                },
+            };
+            RegisterRawInputDevices(devs, (uint)devs.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_INPUT) Handle_WM_INPUT(m.LParam);
+            base.WndProc(ref m);
+        }
+
+        void Handle_WM_INPUT(IntPtr hRawInput)
+        {
         uint hdrSize = (uint)(sizeof(uint) * 2 + IntPtr.Size * 2);   // RAWINPUTHEADER
         uint size = 0;
         if (GetRawInputData(hRawInput, RID_INPUT, IntPtr.Zero, ref size, hdrSize) != 0 || size == 0) return;
@@ -596,17 +666,18 @@ class RawInputListener : NativeWindow, IDisposable
                 int usage = Marshal.ReadByte(buf, off + 1) | (Marshal.ReadByte(buf, off + 2) << 8);
 
                 int dir = usage == USAGE_BRIGHTNESS_UP ? +1 : usage == USAGE_BRIGHTNESS_DOWN ? -1 : 0;
-                if (dir != 0)
-                {
-                    var h = BrightnessKey;
-                    if (h != null) h(dir);
-                }
+                if (dir != 0) _owner.Raise(dir);
             }
         }
         finally { Marshal.FreeHGlobal(buf); }
+        }
     }
 
-    public void Dispose() { if (Handle != IntPtr.Zero) DestroyHandle(); }
+    public void Dispose()
+    {
+        if (_threadId != 0) PostThreadMessageW(_threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+        _thread.Join(1000);
+    }
 }
 
 /// <summary>Click-through black sheet over every monitor, for the below-hardware-zero rungs.</summary>
@@ -748,19 +819,23 @@ class Osd
         _hide.Tick += (s, e) => { _hide.Stop(); _form.Hide(); };
     }
 
+    // Cached: held keys repaint this repeatedly, and building a font per frame
+    // is UI-thread work sitting in the way of nothing useful.
+    static readonly Font TextFont = new Font("Segoe UI", 10f);
+    static readonly SolidBrush TrackBrush = new SolidBrush(Color.FromArgb(70, 70, 70));
+    static readonly SolidBrush FillBrush = new SolidBrush(Color.White);
+
     void Draw(object sender, PaintEventArgs e)
     {
         var g = e.Graphics;
         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
         var track = new Rectangle(20, 38, _form.Width - 40, 8);
-        using (var b = new SolidBrush(Color.FromArgb(70, 70, 70))) g.FillRectangle(b, track);
+        g.FillRectangle(TrackBrush, track);
         int w = (int)Math.Round(track.Width * (_step / (double)Math.Max(1, _total - 1)));
-        using (var b = new SolidBrush(Color.White)) g.FillRectangle(b, new Rectangle(track.X, track.Y, w, track.Height));
+        g.FillRectangle(FillBrush, new Rectangle(track.X, track.Y, w, track.Height));
 
-        using (var f = new Font("Segoe UI", 10f))
-        using (var b = new SolidBrush(Color.White))
-            g.DrawString("Brightness  " + _label, f, b, 20, 12);
+        g.DrawString("Brightness  " + _label, TextFont, FillBrush, 20, 12);
     }
 
     public void Show(int step, int total, string label)

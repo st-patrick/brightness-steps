@@ -115,6 +115,15 @@ reliably as possible:
   Arming late is what let the occasional stomp slip through.
 - The guard thread runs at `ThreadPriority.Highest`. It is blocked between
   presses, but must be scheduled *promptly* when woken.
+- Raw input is pumped on **its own thread**, not the UI thread. `WM_INPUT`
+  behind the overlay's 10 ms animation ticks and the popup's painting is late
+  input, and those are busiest exactly when keys repeat in the dim region.
+- The spin ceiling is a stuck-key backstop only. At its original 3 s, a normal
+  hold from full brightness down to black ran past it: the guard loop never
+  exits while repeats keep extending it, so `startedAt` stayed fixed and the
+  guard quietly dropped to ~2 ms latency **mid-hold**. That is why the flicker
+  came back specifically when holding or pressing fast, and specifically near
+  zero where 2 ms is enough to see.
 
 ## Why the extremes flickered when the middle did not
 
