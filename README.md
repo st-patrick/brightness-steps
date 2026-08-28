@@ -48,12 +48,21 @@ standard HID Consumer Page usages `0x6F`/`0x70` (Display Brightness
 Increment/Decrement), decoded through the device's own HID report descriptor,
 not by scancodes, key positions, or the `Fn` state.
 
-Two things have to be true, and the app tells you if they are not:
+**If your keys are not the standard ones, teach it.** Right-click the tray icon
+and choose **Set up brightness keys**, or run `BrightnessSteps.exe --setup`. It
+asks you to press your darker key, then your brighter key, while listening to
+every HID collection on the machine — and takes the signal that appears for one
+and not the other. That covers vendors who use their own usage pages instead of
+the standard ones, without anybody having to guess what each vendor does. The
+result is saved to `%APPDATA%\BrightnessSteps\keys.cfg`; delete it to go back
+to the defaults.
+
+Two things still have to be true, and the app tells you if they are not:
 
 | requirement | if it is missing |
 | --- | --- |
 | A built-in panel that accepts brightness commands | Tray icon says so on startup |
-| Brightness keys that reach Windows as HID consumer usages | Keys do nothing; the ladder still works from the tray menu |
+| Brightness keys that reach Windows at all (HID usage or virtual key) | Setup finds nothing; the keys are handled below the OS on that model |
 
 **It will not work with external monitors.** Those need DDC/CI over the video
 cable, which is a different mechanism entirely; this drives built-in laptop

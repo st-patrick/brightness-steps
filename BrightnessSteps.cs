@@ -49,6 +49,17 @@ static class Program
             return;
         }
 
+        // Lets the wizard be launched on its own, so keys can be re-taught
+        // without hunting through the tray menu.
+        if (Array.IndexOf(args, "--setup") >= 0)
+        {
+            Application.EnableVisualStyles();
+            KeyConfig.Load();
+            using (var dlg = new SetupForm())
+                if (dlg.ShowDialog() == DialogResult.OK) KeyConfig.Save(dlg.Down, dlg.Up);
+            return;
+        }
+
         bool fresh;
         using (var mutex = new Mutex(true, "BrightnessStepsSingleton", out fresh))
         {
@@ -304,6 +315,7 @@ class TrayApp : ApplicationContext
     readonly Backlight _backlight = new Backlight();
     readonly Guard _guard;
     RawInputListener _raw;
+    KeyboardWatch _keys;
 
     // Key presses arrive on the raw-input thread; the menu and the slider
     // watcher run on the UI thread. Everything shared between them is either
@@ -341,8 +353,14 @@ class TrayApp : ApplicationContext
                 "external monitors are not supported. Use \"Copy compatibility report\" to report this.",
                 ToolTipIcon.Warning);
 
-        _raw = new RawInputListener();
-        _raw.BrightnessKey += OnBrightnessKey;
+        KeyConfig.Load();
+        _raw = new RawInputListener(KeyConfig.Collections(), KeyConfig.Pages());
+        _raw.UsageSeen += OnUsage;
+        if (KeyConfig.NeedsKeyboardHook)
+        {
+            _keys = new KeyboardWatch();
+            _keys.KeyDown += OnVirtualKey;
+        }
 
         StartBrightnessWatcher();
     }
@@ -362,6 +380,7 @@ class TrayApp : ApplicationContext
         m.Items.Add(osd);
 
         m.Items.Add(new ToolStripSeparator());
+        m.Items.Add("Set up brightness keys...", null, (s, e) => RunSetup());
         m.Items.Add("Copy compatibility report", null, (s, e) => ShowReport());
         m.Items.Add(new ToolStripSeparator());
         m.Items.Add("Darker", null, (s, e) => Move(-1));
@@ -404,6 +423,31 @@ class TrayApp : ApplicationContext
         catch { MessageBox.Show(text, "BrightnessSteps"); }
     }
 
+    void RunSetup()
+    {
+        // The running listener keeps its own registration; the wizard opens a
+        // second one that listens to everything, then narrows it down.
+        using (var dlg = new SetupForm())
+        {
+            if (dlg.ShowDialog() != DialogResult.OK) return;
+            KeyConfig.Save(dlg.Down, dlg.Up);
+        }
+
+        if (_raw != null) { _raw.Dispose(); _raw = null; }
+        if (_keys != null) { _keys.Dispose(); _keys = null; }
+
+        _raw = new RawInputListener(KeyConfig.Collections(), KeyConfig.Pages());
+        _raw.UsageSeen += OnUsage;
+        if (KeyConfig.NeedsKeyboardHook)
+        {
+            _keys = new KeyboardWatch();
+            _keys.KeyDown += OnVirtualKey;
+        }
+
+        _tray.ShowBalloonTip(5000, "BrightnessSteps",
+            "Keys set: " + KeyConfig.Down.Describe() + " / " + KeyConfig.Up.Describe(), ToolTipIcon.Info);
+    }
+
     static Icon LoadAppIcon()
     {
         try
@@ -418,6 +462,7 @@ class TrayApp : ApplicationContext
     void Shutdown()
     {
         if (_raw != null) { _raw.Dispose(); _raw = null; }
+        if (_keys != null) { _keys.Dispose(); _keys = null; }
         _guard.Dispose();
         _overlay.Apply(0);
         _backlight.Dispose();
@@ -427,9 +472,18 @@ class TrayApp : ApplicationContext
 
     // ---------- key handling ----------
 
-    void OnBrightnessKey(int direction)
+    void OnUsage(ushort page, ushort usage)
     {
-        Move(direction);        // on the raw-input thread; act at once, don't wait for Windows
+        var sig = KeySignal.Hid(page, usage);
+        if (sig.Matches(KeyConfig.Down)) { Diagnostics.KeyPressesSeen++; Move(-1); }
+        else if (sig.Matches(KeyConfig.Up)) { Diagnostics.KeyPressesSeen++; Move(+1); }
+    }
+
+    void OnVirtualKey(int vk)
+    {
+        var sig = KeySignal.Key(vk);
+        if (sig.Matches(KeyConfig.Down)) { Diagnostics.KeyPressesSeen++; Move(-1); }
+        else if (sig.Matches(KeyConfig.Up)) { Diagnostics.KeyPressesSeen++; Move(+1); }
     }
 
     /// <summary>Same entry point a key press takes. Used by --selftest.</summary>
@@ -897,16 +951,235 @@ class Guard : IDisposable
     }
 }
 
+/// <summary>A brightness key, as this machine actually emits it.</summary>
+struct KeySignal
+{
+    public bool IsHid;
+    public ushort Page, Usage;
+    public int Vk;
+
+    public static KeySignal Hid(ushort page, ushort usage) { return new KeySignal { IsHid = true, Page = page, Usage = usage }; }
+    public static KeySignal Key(int vk) { return new KeySignal { IsHid = false, Vk = vk }; }
+
+    public bool IsSet { get { return IsHid || Vk != 0; } }
+
+    public bool Matches(KeySignal o)
+    {
+        if (IsHid != o.IsHid) return false;
+        return IsHid ? (Page == o.Page && Usage == o.Usage) : Vk == o.Vk;
+    }
+
+    public override string ToString()
+    {
+        return IsHid ? string.Format("hid:{0:X2}/{1:X2}", Page, Usage) : string.Format("vk:{0:X2}", Vk);
+    }
+
+    public string Describe()
+    {
+        if (!IsHid) return "keyboard key 0x" + Vk.ToString("X2");
+        if (Page == 0x0C && Usage == 0x6F) return "standard brightness-up";
+        if (Page == 0x0C && Usage == 0x70) return "standard brightness-down";
+        return string.Format("HID page 0x{0:X2}, usage 0x{1:X2}", Page, Usage);
+    }
+
+    public static bool TryParse(string s, out KeySignal k)
+    {
+        k = new KeySignal();
+        if (string.IsNullOrEmpty(s)) return false;
+        try
+        {
+            if (s.StartsWith("hid:"))
+            {
+                var parts = s.Substring(4).Split('/');
+                k = Hid(Convert.ToUInt16(parts[0], 16), Convert.ToUInt16(parts[1], 16));
+                return true;
+            }
+            if (s.StartsWith("vk:")) { k = Key(Convert.ToInt32(s.Substring(3), 16)); return true; }
+        }
+        catch { }
+        return false;
+    }
+}
+
 /// <summary>
-/// Listens for raw HID consumer-control reports and reports brightness key
-/// presses. Raw input can observe these keys but cannot block them, which is
-/// fine - we only need to know direction and timing.
+/// Which signals mean brighter and darker on this machine. Defaults to the
+/// standard HID Consumer Page usages, which is right on most laptops; the setup
+/// wizard overwrites them for vendors that use something else.
+/// </summary>
+static class KeyConfig
+{
+    public static readonly KeySignal DefaultDown = KeySignal.Hid(0x0C, 0x70);
+    public static readonly KeySignal DefaultUp = KeySignal.Hid(0x0C, 0x6F);
+
+    public static KeySignal Down = DefaultDown;
+    public static KeySignal Up = DefaultUp;
+    public static bool Learned;
+
+    public static string Dir
+    {
+        get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "BrightnessSteps"); }
+    }
+    public static string ConfigFile { get { return Path.Combine(Dir, "keys.cfg"); } }
+
+    public static void Load()
+    {
+        try
+        {
+            if (!File.Exists(ConfigFile)) return;
+            KeySignal d = new KeySignal(), u = new KeySignal();
+            foreach (var line in File.ReadAllLines(ConfigFile))
+            {
+                int eq = line.IndexOf('=');
+                if (eq <= 0 || line.TrimStart().StartsWith("#")) continue;
+                string k = line.Substring(0, eq).Trim(), v = line.Substring(eq + 1).Trim();
+                if (k == "down") KeySignal.TryParse(v, out d);
+                else if (k == "up") KeySignal.TryParse(v, out u);
+            }
+            if (d.IsSet && u.IsSet) { Down = d; Up = u; Learned = true; }
+        }
+        catch { }
+    }
+
+    public static void Save(KeySignal down, KeySignal up)
+    {
+        Down = down; Up = up; Learned = true;
+        try
+        {
+            Directory.CreateDirectory(Dir);
+            File.WriteAllText(ConfigFile,
+                "# Learned by the setup wizard. Delete this file to return to the defaults." + Environment.NewLine +
+                "down=" + down + Environment.NewLine +
+                "up=" + up + Environment.NewLine);
+        }
+        catch { }
+    }
+
+    public static void Reset()
+    {
+        Down = DefaultDown; Up = DefaultUp; Learned = false;
+        try { if (File.Exists(ConfigFile)) File.Delete(ConfigFile); } catch { }
+    }
+
+    /// <summary>Collections raw input must listen to for the configured keys.</summary>
+    public static ushort[][] Collections()
+    {
+        var list = new System.Collections.Generic.List<ushort[]>();
+        list.Add(new ushort[] { 0x0C, 0x01 });                 // consumer control, the usual home
+        foreach (var k in new[] { Down, Up })
+            if (k.IsHid && k.Page != 0x0C) list.Add(new ushort[] { k.Page, 0x01 });
+        return list.ToArray();
+    }
+
+    public static ushort[] Pages()
+    {
+        var list = new System.Collections.Generic.List<ushort>();
+        list.Add(0x0C);
+        foreach (var k in new[] { Down, Up })
+            if (k.IsHid && !list.Contains(k.Page)) list.Add(k.Page);
+        return list.ToArray();
+    }
+
+    public static bool NeedsKeyboardHook { get { return !Down.IsHid || !Up.IsHid; } }
+}
+
+/// <summary>Every HID top-level collection present, so the wizard can listen to all of them.</summary>
+static class HidScan
+{
+    const uint DIGCF_PRESENT = 0x02, DIGCF_DEVICEINTERFACE = 0x10;
+    const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, OPEN_EXISTING = 3;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct SP_DEVICE_INTERFACE_DATA { public uint cbSize; public Guid g; public uint Flags; public IntPtr Reserved; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct HIDP_CAPS
+    {
+        public ushort Usage, UsagePage;
+        public ushort InputReportByteLength, OutputReportByteLength, FeatureReportByteLength;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 17)] public ushort[] Reserved;
+        public ushort NumberLinkCollectionNodes;
+        public ushort NumberInputButtonCaps, NumberInputValueCaps, NumberInputDataIndices;
+        public ushort NumberOutputButtonCaps, NumberOutputValueCaps, NumberOutputDataIndices;
+        public ushort NumberFeatureButtonCaps, NumberFeatureValueCaps, NumberFeatureDataIndices;
+    }
+
+    [DllImport("hid.dll")] static extern void HidD_GetHidGuid(out Guid g);
+    [DllImport("hid.dll")] static extern bool HidD_GetPreparsedData(IntPtr h, out IntPtr pp);
+    [DllImport("hid.dll")] static extern bool HidD_FreePreparsedData(IntPtr pp);
+    [DllImport("hid.dll")] static extern int HidP_GetCaps(IntPtr pp, out HIDP_CAPS caps);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr SetupDiGetClassDevsW(ref Guid g, IntPtr e, IntPtr w, uint f);
+    [DllImport("setupapi.dll", SetLastError = true)]
+    static extern bool SetupDiEnumDeviceInterfaces(IntPtr h, IntPtr d, ref Guid g, uint i, ref SP_DEVICE_INTERFACE_DATA a);
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool SetupDiGetDeviceInterfaceDetailW(IntPtr h, ref SP_DEVICE_INTERFACE_DATA a, IntPtr d, uint s, out uint r, IntPtr i);
+    [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr h);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string p, uint acc, uint share, IntPtr sec, uint disp, uint flags, IntPtr t);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+    public static ushort[][] Collections()
+    {
+        var seen = new System.Collections.Generic.HashSet<int>();
+        var result = new System.Collections.Generic.List<ushort[]>();
+
+        Guid hid;
+        HidD_GetHidGuid(out hid);
+        IntPtr set = SetupDiGetClassDevsW(ref hid, IntPtr.Zero, IntPtr.Zero, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (set == (IntPtr)(-1)) return result.ToArray();
+
+        try
+        {
+            var did = new SP_DEVICE_INTERFACE_DATA();
+            did.cbSize = (uint)Marshal.SizeOf(typeof(SP_DEVICE_INTERFACE_DATA));
+            for (uint i = 0; SetupDiEnumDeviceInterfaces(set, IntPtr.Zero, ref hid, i, ref did); i++)
+            {
+                uint need;
+                SetupDiGetDeviceInterfaceDetailW(set, ref did, IntPtr.Zero, 0, out need, IntPtr.Zero);
+                IntPtr detail = Marshal.AllocHGlobal((int)need);
+                try
+                {
+                    Marshal.WriteInt32(detail, IntPtr.Size == 8 ? 8 : 6);
+                    if (!SetupDiGetDeviceInterfaceDetailW(set, ref did, detail, need, out need, IntPtr.Zero)) continue;
+                    string path = Marshal.PtrToStringUni((IntPtr)(detail.ToInt64() + 4));
+
+                    IntPtr h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                    if (h == (IntPtr)(-1)) continue;
+                    try
+                    {
+                        IntPtr pp;
+                        if (!HidD_GetPreparsedData(h, out pp)) continue;
+                        HIDP_CAPS caps;
+                        HidP_GetCaps(pp, out caps);
+                        HidD_FreePreparsedData(pp);
+
+                        // Mouse and keyboard top-level collections belong to the
+                        // system; listening to them would pull in ordinary typing.
+                        if (caps.UsagePage == 0x01 && (caps.Usage == 0x02 || caps.Usage == 0x06)) continue;
+
+                        int key = (caps.UsagePage << 16) | caps.Usage;
+                        if (seen.Add(key)) result.Add(new ushort[] { caps.UsagePage, caps.Usage });
+                    }
+                    finally { CloseHandle(h); }
+                }
+                finally { Marshal.FreeHGlobal(detail); }
+            }
+        }
+        finally { SetupDiDestroyDeviceInfoList(set); }
+
+        return result.ToArray();
+    }
+}
+
+/// <summary>
+/// Listens for raw HID reports and reports the usages seen. Raw input can
+/// observe brightness keys but cannot block them, which is fine - we only need
+/// to know direction and timing.
 ///
 /// It runs on its own thread with its own message loop. On the UI thread,
 /// WM_INPUT would queue behind the overlay's animation ticks and the popup's
-/// painting - which is precisely what is happening when keys are held or
-/// pressed quickly in the dim region, so the guard got armed late exactly when
-/// presses came fastest.
+/// painting - exactly what is busiest when keys are held or pressed quickly in
+/// the dim region, so the guard got armed late when it mattered most.
 /// </summary>
 class RawInputListener : IDisposable
 {
@@ -914,20 +1187,15 @@ class RawInputListener : IDisposable
     const int WM_QUIT = 0x0012;
     const int RIDEV_INPUTSINK = 0x00000100;
     const uint RID_INPUT = 0x10000003;
-    const ushort USAGE_PAGE_CONSUMER = 0x0C;
-    const ushort USAGE_CONSUMER_CONTROL = 0x01;
-    const int USAGE_BRIGHTNESS_UP = 0x6F;
-    const int USAGE_BRIGHTNESS_DOWN = 0x70;
+    const uint RIDI_PREPARSEDDATA = 0x20000005;
+    const int HIDP_INPUT = 0;
+    const int HIDP_STATUS_SUCCESS = 0x00110000;
 
     [StructLayout(LayoutKind.Sequential)]
     struct RAWINPUTDEVICE { public ushort UsagePage, Usage; public int Flags; public IntPtr hwndTarget; }
 
     [StructLayout(LayoutKind.Sequential)]
     struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam, lParam; public uint time; public int ptX, ptY; }
-
-    const uint RIDI_PREPARSEDDATA = 0x20000005;
-    const int HIDP_INPUT = 0;
-    const int HIDP_STATUS_SUCCESS = 0x00110000;
 
     [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] d, uint num, uint size);
     [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr hRawInput, uint cmd, IntPtr data, ref uint size, uint hdrSize);
@@ -941,16 +1209,22 @@ class RawInputListener : IDisposable
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool PostThreadMessageW(uint tid, uint msg, IntPtr w, IntPtr l);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
 
-    /// <summary>Raised on the listener's own thread, not the UI thread.</summary>
-    public event Action<int> BrightnessKey;
+    /// <summary>Raised on the listener's own thread for every usage seen.</summary>
+    public event Action<ushort, ushort> UsageSeen;
 
+    readonly ushort[][] _collections;
+    readonly ushort[] _pages;
     readonly Thread _thread;
     readonly ManualResetEventSlim _ready = new ManualResetEventSlim(false);
+    readonly System.Collections.Generic.Dictionary<IntPtr, IntPtr> _preparsed =
+        new System.Collections.Generic.Dictionary<IntPtr, IntPtr>();
     Sink _sink;
     uint _threadId;
 
-    public RawInputListener()
+    public RawInputListener(ushort[][] collections, ushort[] pages)
     {
+        _collections = collections;
+        _pages = pages;
         _thread = new Thread(Pump)
         {
             IsBackground = true,
@@ -972,13 +1246,12 @@ class RawInputListener : IDisposable
         while (GetMessageW(out m, IntPtr.Zero, 0, 0) > 0) { TranslateMessage(ref m); DispatchMessageW(ref m); }
     }
 
-    void Raise(int direction)
+    void Raise(ushort page, ushort usage)
     {
-        var h = BrightnessKey;
-        if (h != null) h(direction);
+        var h = UsageSeen;
+        if (h != null) h(page, usage);
     }
 
-    /// <summary>The message-only window, created on and pumped by the listener thread.</summary>
     class Sink : NativeWindow
     {
         readonly RawInputListener _owner;
@@ -988,18 +1261,18 @@ class RawInputListener : IDisposable
             _owner = owner;
             CreateHandle(new CreateParams { Parent = (IntPtr)(-3) });   // HWND_MESSAGE
 
-            var devs = new[]
-            {
-                new RAWINPUTDEVICE
+            var devs = new RAWINPUTDEVICE[owner._collections.Length];
+            for (int i = 0; i < devs.Length; i++)
+                devs[i] = new RAWINPUTDEVICE
                 {
-                    UsagePage = USAGE_PAGE_CONSUMER,
-                    Usage = USAGE_CONSUMER_CONTROL,
+                    UsagePage = owner._collections[i][0],
+                    Usage = owner._collections[i][1],
                     Flags = RIDEV_INPUTSINK,        // deliver even when we have no focus
                     hwndTarget = Handle,
-                },
-            };
-            Diagnostics.RawInputRegistered =
-                RegisterRawInputDevices(devs, (uint)devs.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+                };
+
+            bool ok = RegisterRawInputDevices(devs, (uint)devs.Length, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+            if (!Diagnostics.RawInputRegistered) Diagnostics.RawInputRegistered = ok;
         }
 
         protected override void WndProc(ref Message m)
@@ -1010,86 +1283,86 @@ class RawInputListener : IDisposable
 
         void Handle_WM_INPUT(IntPtr hRawInput)
         {
-        uint hdrSize = (uint)(sizeof(uint) * 2 + IntPtr.Size * 2);   // RAWINPUTHEADER
-        uint size = 0;
-        if (GetRawInputData(hRawInput, RID_INPUT, IntPtr.Zero, ref size, hdrSize) != 0 || size == 0) return;
+            uint hdrSize = (uint)(sizeof(uint) * 2 + IntPtr.Size * 2);   // RAWINPUTHEADER
+            uint size = 0;
+            if (GetRawInputData(hRawInput, RID_INPUT, IntPtr.Zero, ref size, hdrSize) != 0 || size == 0) return;
 
-        IntPtr buf = Marshal.AllocHGlobal((int)size);
-        try
-        {
-            if (GetRawInputData(hRawInput, RID_INPUT, buf, ref size, hdrSize) != size) return;
-            if (Marshal.ReadInt32(buf, 0) != 2) return;              // RIM_TYPEHID
-
-            int sizeHid = Marshal.ReadInt32(buf, (int)hdrSize);
-            int count = Marshal.ReadInt32(buf, (int)hdrSize + 4);
-            int data = (int)hdrSize + 8;
-            if (sizeHid < 3) return;
-
-            IntPtr hDevice = Marshal.ReadIntPtr(buf, 8);        // RAWINPUTHEADER.hDevice
-            IntPtr preparsed = _owner.PreparsedFor(hDevice);
-
-            for (int r = 0; r < count; r++)
+            IntPtr buf = Marshal.AllocHGlobal((int)size);
+            try
             {
-                int off = data + r * sizeHid;
-                if (off + sizeHid > size) break;
-                IntPtr report = (IntPtr)(buf.ToInt64() + off);
+                if (GetRawInputData(hRawInput, RID_INPUT, buf, ref size, hdrSize) != size) return;
+                if (Marshal.ReadInt32(buf, 0) != 2) return;              // RIM_TYPEHID
 
-                int dir;
-                if (preparsed != IntPtr.Zero)
-                {
-                    dir = DecodeWithHid(preparsed, report, (uint)sizeHid);
-                    if (dir != 0) Diagnostics.DecodedByDescriptor++;
-                }
-                else
-                {
-                    dir = DecodeByLayout(buf, off, sizeHid, (int)size);
-                    if (dir != 0) Diagnostics.DecodedByFallbackLayout++;
-                }
+                int sizeHid = Marshal.ReadInt32(buf, (int)hdrSize);
+                int count = Marshal.ReadInt32(buf, (int)hdrSize + 4);
+                int data = (int)hdrSize + 8;
+                if (sizeHid < 2) return;
 
-                if (dir != 0) { Diagnostics.KeyPressesSeen++; _owner.Raise(dir); }
+                IntPtr hDevice = Marshal.ReadIntPtr(buf, 8);             // RAWINPUTHEADER.hDevice
+                IntPtr preparsed = _owner.PreparsedFor(hDevice);
+
+                for (int r = 0; r < count; r++)
+                {
+                    int off = data + r * sizeHid;
+                    if (off + sizeHid > size) break;
+                    IntPtr report = (IntPtr)(buf.ToInt64() + off);
+
+                    if (preparsed != IntPtr.Zero)
+                    {
+                        foreach (ushort page in _owner._pages)
+                        {
+                            ushort[] usages = UsagesOn(preparsed, page, report, (uint)sizeHid);
+                            for (int u = 0; u < usages.Length; u++)
+                            {
+                                Diagnostics.DecodedByDescriptor++;
+                                _owner.Raise(page, usages[u]);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        ushort one = ByLayout(buf, off, sizeHid, (int)size);
+                        if (one != 0) { Diagnostics.DecodedByFallbackLayout++; _owner.Raise(0x0C, one); }
+                    }
+                }
             }
-        }
-        finally { Marshal.FreeHGlobal(buf); }
+            finally { Marshal.FreeHGlobal(buf); }
         }
 
         /// <summary>
         /// Decodes a report the way the device's own descriptor says to, rather
         /// than assuming a byte layout. Consumer-control reports differ between
         /// vendors - some send a 16-bit usage, some a bitmap, with varying report
-        /// ids and padding - so this is what makes the app work on machines other
-        /// than the one it was written on.
+        /// ids and padding - so this is what lets it work on hardware other than
+        /// the machine it was written on.
         /// </summary>
-        static int DecodeWithHid(IntPtr preparsed, IntPtr report, uint reportLength)
+        static ushort[] UsagesOn(IntPtr preparsed, ushort page, IntPtr report, uint reportLength)
         {
-            int max = HidP_MaxUsageListLength(HIDP_INPUT, USAGE_PAGE_CONSUMER, preparsed);
-            if (max <= 0) return 0;
+            int max = HidP_MaxUsageListLength(HIDP_INPUT, page, preparsed);
+            if (max <= 0) return EmptyUsages;
 
             var usages = new ushort[max];
             uint len = (uint)max;
-            if (HidP_GetUsages(HIDP_INPUT, USAGE_PAGE_CONSUMER, 0, usages, ref len, preparsed, report, reportLength) != HIDP_STATUS_SUCCESS)
-                return 0;
+            if (HidP_GetUsages(HIDP_INPUT, page, 0, usages, ref len, preparsed, report, reportLength) != HIDP_STATUS_SUCCESS)
+                return EmptyUsages;
 
-            for (int i = 0; i < len; i++)
-            {
-                if (usages[i] == USAGE_BRIGHTNESS_UP) return +1;
-                if (usages[i] == USAGE_BRIGHTNESS_DOWN) return -1;
-            }
-            return 0;
+            if (len == usages.Length) return usages;
+            var trimmed = new ushort[len];
+            Array.Copy(usages, trimmed, (int)len);
+            return trimmed;
         }
 
+        static readonly ushort[] EmptyUsages = new ushort[0];
+
         /// <summary>Fallback for the common "report id then 16-bit usage" layout.</summary>
-        static int DecodeByLayout(IntPtr buf, int off, int sizeHid, int size)
+        static ushort ByLayout(IntPtr buf, int off, int sizeHid, int size)
         {
             if (sizeHid < 3 || off + 3 > size) return 0;
-            int usage = Marshal.ReadByte(buf, off + 1) | (Marshal.ReadByte(buf, off + 2) << 8);
-            return usage == USAGE_BRIGHTNESS_UP ? +1 : usage == USAGE_BRIGHTNESS_DOWN ? -1 : 0;
+            return (ushort)(Marshal.ReadByte(buf, off + 1) | (Marshal.ReadByte(buf, off + 2) << 8));
         }
     }
 
     // One preparsed descriptor per device, kept for the life of the listener.
-    readonly System.Collections.Generic.Dictionary<IntPtr, IntPtr> _preparsed =
-        new System.Collections.Generic.Dictionary<IntPtr, IntPtr>();
-
     internal IntPtr PreparsedFor(IntPtr hDevice)
     {
         IntPtr pp;
@@ -1117,6 +1390,53 @@ class RawInputListener : IDisposable
         foreach (var pp in _preparsed.Values) if (pp != IntPtr.Zero) Marshal.FreeHGlobal(pp);
         _preparsed.Clear();
     }
+}
+
+/// <summary>
+/// Low-level keyboard hook, installed only when a learned key turns out to be
+/// an ordinary virtual key rather than a HID usage. Most laptops never need it.
+/// </summary>
+class KeyboardWatch : IDisposable
+{
+    const int WH_KEYBOARD_LL = 13;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time; public IntPtr dwExtraInfo; }
+
+    delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc fn, IntPtr hMod, uint tid);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+
+    readonly HookProc _proc;        // must outlive the hook
+    IntPtr _handle;
+
+    public event Action<int> KeyDown;
+
+    public KeyboardWatch()
+    {
+        _proc = Callback;
+        _handle = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null), 0);
+    }
+
+    IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int msg = wParam.ToInt32();
+            if (msg == 0x0100 || msg == 0x0104)     // key down
+            {
+                var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                var h = KeyDown;
+                if (h != null) h((int)k.vkCode);
+            }
+        }
+        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+    }
+
+    public void Dispose() { if (_handle != IntPtr.Zero) { UnhookWindowsHookEx(_handle); _handle = IntPtr.Zero; } }
 }
 
 /// <summary>Click-through black sheet over every monitor, for the below-hardware-zero rungs.</summary>
@@ -1294,4 +1614,204 @@ class Osd
 }
 
 
+
+
+/// <summary>
+/// Asks the user to press their own brightness keys and learns whatever this
+/// machine actually emits. This is what makes the app work on vendors that do
+/// not use the standard HID brightness usages: rather than guessing every
+/// vendor's encoding, listen to every HID collection on the box and take the
+/// signal that shows up for "darker" but not for "brighter", and vice versa.
+/// </summary>
+class SetupForm : Form
+{
+    readonly Label _step = new Label();
+    readonly Label _hint = new Label();
+    readonly Label _status = new Label();
+    readonly Button _next = new Button();
+    readonly Button _cancel = new Button();
+
+    RawInputListener _listen;
+    KeyboardWatch _keys;
+
+    readonly System.Collections.Generic.Dictionary<string, int> _phase1 = new System.Collections.Generic.Dictionary<string, int>();
+    readonly System.Collections.Generic.Dictionary<string, int> _phase2 = new System.Collections.Generic.Dictionary<string, int>();
+    readonly System.Collections.Generic.Dictionary<string, KeySignal> _signals = new System.Collections.Generic.Dictionary<string, KeySignal>();
+
+    int _phase;                 // 0 = darker, 1 = brighter, 2 = result
+    public KeySignal Down, Up;
+
+    public SetupForm()
+    {
+        Text = "BrightnessSteps - set up your keys";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterScreen;
+        MaximizeBox = MinimizeBox = false;
+        ClientSize = new Size(470, 236);
+        BackColor = Color.FromArgb(24, 26, 32);
+        ForeColor = Color.White;
+        try { Icon = new Icon(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "app.ico")); } catch { }
+
+        _step.SetBounds(24, 22, 420, 26);
+        _step.Font = new Font("Segoe UI", 13f, FontStyle.Bold);
+        _step.ForeColor = Color.FromArgb(240, 201, 135);
+
+        _hint.SetBounds(24, 56, 420, 74);
+        _hint.Font = new Font("Segoe UI", 9.75f);
+        _hint.ForeColor = Color.FromArgb(200, 208, 222);
+
+        _status.SetBounds(24, 132, 420, 46);
+        _status.Font = new Font("Consolas", 9f);
+        _status.ForeColor = Color.FromArgb(150, 160, 178);
+
+        _next.SetBounds(330, 190, 112, 30);
+        _next.Text = "Continue";
+        _next.Enabled = false;
+        _next.FlatStyle = FlatStyle.System;
+        _next.Click += (s, e) => Advance();
+
+        _cancel.SetBounds(210, 190, 108, 30);
+        _cancel.Text = "Cancel";
+        _cancel.FlatStyle = FlatStyle.System;
+        _cancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+
+        Controls.AddRange(new Control[] { _step, _hint, _status, _next, _cancel });
+
+        Load += (s, e) => Begin();
+        FormClosed += (s, e) => StopListening();
+    }
+
+    void Begin()
+    {
+        // Listen to every HID collection present, not just the standard one -
+        // that is the whole point of asking rather than assuming.
+        var collections = HidScan.Collections();
+        if (collections.Length == 0) collections = new[] { new ushort[] { 0x0C, 0x01 } };
+
+        var pageList = new System.Collections.Generic.List<ushort>();
+        foreach (var c in collections) if (!pageList.Contains(c[0])) pageList.Add(c[0]);
+        if (!pageList.Contains(0x0C)) pageList.Add(0x0C);
+
+        _listen = new RawInputListener(collections, pageList.ToArray());
+        _listen.UsageSeen += (page, usage) => Record(KeySignal.Hid(page, usage));
+
+        _keys = new KeyboardWatch();
+        _keys.KeyDown += vk => Record(KeySignal.Key(vk));
+
+        ShowPhase();
+    }
+
+    void StopListening()
+    {
+        if (_listen != null) { _listen.Dispose(); _listen = null; }
+        if (_keys != null) { _keys.Dispose(); _keys = null; }
+    }
+
+    void Record(KeySignal sig)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        try { BeginInvoke((Action)(() => RecordOnUi(sig))); } catch { }
+    }
+
+    void RecordOnUi(KeySignal sig)
+    {
+        if (_phase > 1) return;
+        string key = sig.ToString();
+        _signals[key] = sig;
+
+        var bucket = _phase == 0 ? _phase1 : _phase2;
+        int n;
+        bucket[key] = bucket.TryGetValue(key, out n) ? n + 1 : 1;
+
+        _next.Enabled = Candidates().Length > 0 || _phase == 1;
+        ShowStatus();
+    }
+
+    /// <summary>Signals seen in this phase that the other phase has not claimed.</summary>
+    string[] Candidates()
+    {
+        var mine = _phase == 0 ? _phase1 : _phase2;
+        var other = _phase == 0 ? _phase2 : _phase1;
+
+        var list = new System.Collections.Generic.List<string>();
+        foreach (var kv in mine) if (!other.ContainsKey(kv.Key)) list.Add(kv.Key);
+        list.Sort((a, b) => mine[b].CompareTo(mine[a]));
+        return list.ToArray();
+    }
+
+    void ShowPhase()
+    {
+        if (_phase == 0)
+        {
+            _step.Text = "1 of 2 - press your DARKER key";
+            _hint.Text = "Press the key you use to make the screen dimmer, three or four times.\r\n\r\n"
+                       + "Press nothing else. If your keys need Fn, hold Fn as you normally would.";
+            _next.Text = "Continue";
+        }
+        else if (_phase == 1)
+        {
+            _step.Text = "2 of 2 - press your BRIGHTER key";
+            _hint.Text = "Now press the key you use to make the screen brighter, three or four times.\r\n\r\n"
+                       + "Press nothing else.";
+            _next.Text = "Continue";
+        }
+        _next.Enabled = false;
+        ShowStatus();
+    }
+
+    void ShowStatus()
+    {
+        if (_phase > 1) return;
+        var c = Candidates();
+        if (c.Length == 0) { _status.Text = "waiting for a key..."; return; }
+
+        var bucket = _phase == 0 ? _phase1 : _phase2;
+        _status.Text = "detected: " + _signals[c[0]].Describe() + "   (" + bucket[c[0]] + " presses)";
+        if (c.Length > 1) _status.Text += "\r\n+ " + (c.Length - 1) + " other signal(s); the most frequent wins";
+    }
+
+    void Advance()
+    {
+        if (_phase == 0)
+        {
+            var c = Candidates();
+            if (c.Length == 0) return;
+            Down = _signals[c[0]];
+            _phase = 1;
+            ShowPhase();
+            return;
+        }
+
+        if (_phase == 1)
+        {
+            var c = Candidates();
+            if (c.Length == 0)
+            {
+                MessageBox.Show(this,
+                    "No separate signal was seen for the brighter key.\r\n\r\n"
+                    + "Either it emits the same thing as the darker key, or it never reaches "
+                    + "Windows on this machine. BrightnessSteps cannot drive it in that case.",
+                    "BrightnessSteps", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            Up = _signals[c[0]];
+
+            _phase = 2;
+            StopListening();
+
+            _step.Text = "Done";
+            _hint.Text = "Darker:   " + Down.Describe() + "\r\n"
+                       + "Brighter: " + Up.Describe() + "\r\n\r\n"
+                       + "Saved to your profile. Choose \"Set up brightness keys\" again to redo it.";
+            _status.Text = Down.ToString() + "   /   " + Up.ToString();
+            _next.Text = "Finish";
+            _next.Enabled = true;
+            _cancel.Text = "Discard";
+            return;
+        }
+
+        DialogResult = DialogResult.OK;
+        Close();
+    }
+}
 

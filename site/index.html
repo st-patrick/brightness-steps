@@ -117,6 +117,11 @@
       <tr><td>A built-in panel that accepts brightness commands</td><td>The tray icon tells you on startup</td></tr>
       <tr><td>Brightness keys that reach Windows as HID usages</td><td>Keys do nothing; the tray menu still works</td></tr>
     </table>
+    <p style="margin-top:16px"><b>Different keys? Teach it.</b> The tray menu has
+      <b>Set up brightness keys</b>: press your darker key, then your brighter one, while it
+      listens to every HID collection on the machine and takes the signal that appears for one
+      and not the other. That covers vendors who use their own encoding, instead of guessing
+      what each one does.</p>
     <p class="note" style="margin-top:16px"><b style="color:var(--ink)">External monitors are not supported.</b>
       Those need DDC/CI over the video cable — a different mechanism. This drives built-in
       laptop panels through the display driver.</p>
