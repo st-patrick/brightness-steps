@@ -43,18 +43,40 @@ Three things were measured on this machine before the design was fixed:
    click-through black layered window instead — no admin, and it disappears with
    the process, so a crash can never leave the screen black.
 
-Given that, each press works as: see the HID report → let Windows apply its ±10
-step → immediately overwrite it with the correct ladder rung. Windows' step is
-briefly visible as a short flicker; that is inherent, since the key cannot be
-blocked without a filter driver.
-
-If Windows is already pinned at 0 or 100 its step produces no brightness event
-at all, so after `KeySettleMs` (160 ms) the key is acted on directly. This is
-what makes the below-zero overlay rungs reachable.
+Given that, each press works as: apply our rung the instant the HID report
+arrives, then *hold* it. Windows still stomps on it ~20 ms later, so a guard
+loop polls the backlight every millisecond for 220 ms afterwards and puts the
+value straight back.
 
 External brightness changes with no preceding key press — the slider, battery
 saver, adaptive brightness — are followed rather than fought, and clear the
-overlay.
+overlay. The guard window is excluded from that, since during it we are
+deliberately overriding Windows.
+
+## Why it goes through the display driver, not WMI
+
+Windows' step cannot be blocked, so it is always briefly visible. The only thing
+left to control is *how long*. Measured on this machine:
+
+| operation | cost |
+| --- | --- |
+| `WmiSetBrightness` (the obvious API) | 10.1 ms median |
+| `IOCTL_VIDEO_SET_DISPLAY_BRIGHTNESS` | **0.16 ms** median |
+
+So brightness is read and written straight through the monitor device
+(`\\?\display#...`, opened unelevated), which is the layer underneath WMI. That
+is what makes a 1 ms poll loop affordable, and it cuts the window during which
+Windows' wrong value is on screen from ~10 ms to **1.8 ms measured**. WMI is
+kept only as a fallback if the device cannot be opened.
+
+One pleasant side effect of acting *before* Windows: Windows computes its step
+from whatever brightness it finds, which by then is already our new rung. So a
+press downward makes it aim 10 lower still and clamp toward 0 — the residual
+blip goes *darker* rather than flashing bright, which is much easier on the eyes
+at night. Presses upward still blip bright.
+
+Below hardware zero there is no flicker at all going down: hardware is already
+pinned at 0, Windows' step cannot go lower, and only the overlay changes.
 
 ## Tray menu
 
