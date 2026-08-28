@@ -77,11 +77,32 @@ console.log("upload ok");
 // --- verify every uploaded file, by size ------------------------------------
 // A failed STOR leaves a 0-byte file behind while curl still exits 0, so
 // checking only the page and the installer let a truncated image ship once.
+// PHP is executed, not served, and the host injects a snippet into HTML, so a
+// byte-for-byte compare only makes sense for static assets. Everything else is
+// checked by whether it actually works.
 async function check(f) {
   const local = Bun.file(join(ROOT, f)).size;
+
+  if (f.endsWith(".php")) {
+    // A truncated PHP file fails to parse; a working one accepts an event.
+    const r = await fetch(LIVE_URL + f, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "e=__probe__",
+    });
+    return { f, local, remote: r.status, ok: r.status === 204, note: `HTTP ${r.status}` };
+  }
+
   const r = await fetch(LIVE_URL + f + "?nocache=" + Date.now());
-  const remote = (await r.arrayBuffer()).byteLength;
-  return { f, local, remote, ok: r.ok && remote === local };
+  const bytes = await r.arrayBuffer();
+
+  if (f.endsWith(".html")) {
+    const text = new TextDecoder().decode(bytes);
+    const ok = r.ok && text.includes("BrightnessSteps") && text.includes("</body>");
+    return { f, local, remote: bytes.byteLength, ok, note: "rendered" };
+  }
+
+  return { f, local, remote: bytes.byteLength, ok: r.ok && bytes.byteLength === local, note: "bytes" };
 }
 
 function upload(files) {
@@ -107,7 +128,7 @@ if (failed.length) {
 }
 
 for (const r of results)
-  console.log(`  ${r.ok ? "ok  " : "BAD "} ${r.f.padEnd(30)} ${r.remote} / ${r.local} bytes`);
+  console.log(`  ${r.ok ? "ok  " : "BAD "} ${r.f.padEnd(30)} ${r.remote} / ${r.local} (${r.note})`);
 
 const bad = results.filter(r => !r.ok).length;
 if (bad) { console.error(`
