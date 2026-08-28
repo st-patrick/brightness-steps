@@ -117,11 +117,10 @@ Three things were measured on this machine before the design was fixed:
    `0x6F` (up) and `0x70` (down) — arriving about 20 ms *before* Windows applies
    its own ±10 step. So the direction of every press is known unambiguously,
    which is what separates a key press from someone dragging the slider.
-3. **Gamma-ramp dimming is clamped.** `SetDeviceGammaRamp` is refused outright
-   (Windows restricts ramps unless `HKLM\...\ICM\GdiIcmGammaRange` is set, which
-   needs admin plus a reboot). So "darker than hardware zero" uses a
-   click-through black layered window instead — no admin, and it disappears with
-   the process, so a crash can never leave the screen black.
+3. **Gamma-ramp dimming is clamped by default.** `SetDeviceGammaRamp` refuses
+   anything below about 60% unless `HKLM\...\ICM\GdiIcmGammaRange` is set, which
+   needs admin plus a reboot. So there are two ways to go below hardware zero,
+   and the app picks at startup — see *Below hardware zero* below.
 
 Given that, each press works as: apply our rung the instant the HID report
 arrives, then *hold* it. Windows still stomps on it ~20 ms later, so a guard
@@ -264,7 +263,31 @@ prompt on every boot and buy nothing. The only remaining way to truly block the
 key is a kernel-mode HID filter driver, which needs test-signing or an EV
 certificate — far past what this is worth.
 
-### The one admin-gated change worth making: lifting the gamma clamp
+## Below hardware zero: gamma, or an overlay
+
+Two mechanisms, chosen at startup, in this order:
+
+| | how | trade-off |
+| --- | --- | --- |
+| **gamma ramp** (preferred) | scales the display's gamma curve | invisible to screenshots and screen shares, never on top of fullscreen apps — but needs the clamp lifted, and **outlives the process** |
+| **black overlay** (fallback) | click-through layered window | always available, no admin — but it is a real window, so it captures and it sits above fullscreen apps |
+
+Gamma is only chosen if a deep ramp is *actually* accepted: the registry value
+can be set while a driver still refuses, so the app applies a 30% ramp and
+restores it in the same breath (sub-millisecond, invisible) and only commits to
+gamma if that took.
+
+Because a gamma ramp survives the process that set it, killing the app while the
+screen is dimmed would otherwise leave it dark. So the original ramp is saved to
+`%APPDATA%\BrightnessSteps\gamma-original.bin` and a marker file is written
+while dimmed; the next start sees the marker and puts the ramp back. The overlay
+has no such problem — it dies with its process.
+
+The setup wizard offers to lift the clamp for you (one administrator prompt,
+takes effect after a restart). Until then, the overlay is used and everything
+still works.
+
+### Lifting the gamma clamp by hand
 
 By default Windows only permits mild gamma dimming. Measured on this machine,
 before any change:
@@ -284,7 +307,7 @@ It would **not** reduce flicker, which is about backlight writes, and gamma can
 be reset by other colour-management software, so the overlay stays as the
 fallback either way.
 
-**This key has been set on this machine.** To undo it, run elevated:
+To undo it, run elevated:
 
 ```powershell
 Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM' `

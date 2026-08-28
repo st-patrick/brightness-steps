@@ -39,6 +39,17 @@ static class Program
     [STAThread]
     static void Main(string[] args)
     {
+        // A previous run killed while the screen was gamma-dimmed leaves the
+        // ramp dark. Put it back before anything else can look at it.
+        GammaDimmer.RecoverIfCrashed();
+
+        // Written by the elevated copy the setup wizard launches.
+        if (Array.IndexOf(args, "--enable-gamma") >= 0)
+        {
+            Environment.ExitCode = GammaSupport.WriteValue() ? 0 : 1;
+            return;
+        }
+
         // --selftest drives the real key path with a simulated Windows stomp, so
         // the press/stomp race can be reproduced without a physical keyboard.
         // It deliberately skips the singleton; stop the running instance first.
@@ -110,6 +121,7 @@ static class Diagnostics
     public static int DecodedByFallbackLayout;
     public static bool RawInputRegistered;
     public static string BacklightMethod = "none";
+    public static string DimMethod = "overlay";
     public static string BacklightDevice = "";
     public static int SupportedLevels = -1;
 
@@ -134,6 +146,7 @@ static class Diagnostics
         sb.AppendLine("  method        : " + BacklightMethod);
         sb.AppendLine("  device        : " + (BacklightDevice == "" ? "(none)" : BacklightDevice));
         sb.AppendLine("  levels        : " + (SupportedLevels < 0 ? "unknown" : SupportedLevels.ToString()));
+        sb.AppendLine("  below zero    : " + DimMethod);
         sb.AppendLine();
 
         sb.AppendLine("[brightness keys]");
@@ -335,7 +348,7 @@ class TrayApp : ApplicationContext
     const int GuardMs = 220;
 
     readonly NotifyIcon _tray;
-    readonly DimOverlay _overlay = new DimOverlay();
+    readonly Dimmer _dimmer = Dimmer.Create();
     readonly Osd _osd = new Osd();
     readonly Control _sync = new Control();      // marshals WMI callbacks onto the UI thread
     readonly Backlight _backlight = new Backlight();
@@ -536,7 +549,7 @@ class TrayApp : ApplicationContext
         if (_raw != null) { _raw.Dispose(); _raw = null; }
         if (_keys != null) { _keys.Dispose(); _keys = null; }
         _guard.Dispose();
-        _overlay.Apply(0);
+        _dimmer.Dispose();
         _backlight.Dispose();
         _tray.Visible = false;
         ExitThread();
@@ -593,7 +606,7 @@ class TrayApp : ApplicationContext
         // and so does its neighbour - the two never change in the same step.
         Action present = () =>
         {
-            _overlay.Apply(s.Alpha);
+            _dimmer.Apply(s.Alpha);
             if (_showOsd) _osd.Show(i, Ladder.Length, DescribeStep(s));
         };
 
@@ -675,7 +688,7 @@ class TrayApp : ApplicationContext
         // brightness. Follow it rather than fight it.
         _desiredHw = actual;
         lock (_ladderLock) { _index = IndexForHardware(actual); }
-        if (_overlay.Alpha != 0) _overlay.Apply(0);
+        if (_dimmer.Alpha != 0) _dimmer.Apply(0);
     }
 }
 
@@ -1511,8 +1524,279 @@ class KeyboardWatch : IDisposable
     public void Dispose() { if (_handle != IntPtr.Zero) { UnhookWindowsHookEx(_handle); _handle = IntPtr.Zero; } }
 }
 
-/// <summary>Click-through black sheet over every monitor, for the below-hardware-zero rungs.</summary>
-class DimOverlay
+/// <summary>
+/// Whether Windows will accept a gamma ramp dark enough to be useful. By
+/// default it refuses anything below about 60%, which is why the overlay
+/// exists; the machine-wide GdiIcmGammaRange value lifts that.
+/// </summary>
+static class GammaSupport
+{
+    const string KeyPath = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM";
+    const string ValueName = "GdiIcmGammaRange";
+
+    public static bool Unlocked
+    {
+        get
+        {
+            try
+            {
+                using (var k = Registry.LocalMachine.OpenSubKey(KeyPath))
+                    return k != null && Convert.ToInt32(k.GetValue(ValueName, 0)) >= 256;
+            }
+            catch { return false; }
+        }
+    }
+
+    /// <summary>Writes the value. Needs elevation, hence its own process.</summary>
+    public static bool WriteValue()
+    {
+        try
+        {
+            using (var k = Registry.LocalMachine.CreateSubKey(KeyPath))
+            {
+                if (k == null) return false;
+                k.SetValue(ValueName, 256, RegistryValueKind.DWord);
+                return true;
+            }
+        }
+        catch { return false; }
+    }
+
+    /// <summary>Re-runs this exe elevated to write the value. Returns true if it took.</summary>
+    public static bool RequestEnable()
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(Application.ExecutablePath, "--enable-gamma")
+            {
+                UseShellExecute = true,
+                Verb = "runas",                 // the UAC prompt the user just agreed to
+            };
+            var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return false;
+            proc.WaitForExit(60000);
+            return Unlocked;
+        }
+        catch { return false; }                 // cancelled the prompt
+    }
+}
+
+/// <summary>
+/// Darkens the screen below what the backlight alone can manage. Two
+/// implementations: a gamma ramp where Windows allows one, and a black overlay
+/// window everywhere else. Both fade on the same curve as the panel's own
+/// brightness ramp, so the two halves of the ladder feel like one control.
+/// </summary>
+abstract class Dimmer : IDisposable
+{
+    const int FadeMs = 170;
+
+    readonly System.Windows.Forms.Timer _anim;
+    readonly System.Diagnostics.Stopwatch _clock = new System.Diagnostics.Stopwatch();
+    double _from, _current;
+
+    /// <summary>Where it is headed, not where the fade currently is.</summary>
+    public int Alpha { get; private set; }
+
+    protected Dimmer()
+    {
+        _anim = new System.Windows.Forms.Timer { Interval = 10 };
+        _anim.Tick += Tick;
+    }
+
+    public void Apply(int alpha)
+    {
+        if (alpha == Alpha && !_anim.Enabled) return;
+
+        Alpha = alpha;
+        _from = _current;                       // retarget mid-fade rather than jumping
+        _clock.Restart();
+        if (alpha > 0) OnBeforeShow(_current);
+        _anim.Start();
+    }
+
+    void Tick(object sender, EventArgs e)
+    {
+        double t = _clock.Elapsed.TotalMilliseconds / FadeMs;
+        bool done = t >= 1;
+        if (done) t = 1;
+
+        _current = _from + (Alpha - _from) * Ease(t);
+        OnLevel(_current);
+
+        if (!done) return;
+        _anim.Stop();
+        _clock.Stop();
+        if (Alpha <= 0) OnCleared();
+    }
+
+    /// <summary>Ease in/out cubic - eases off at both ends like the panel's own ramp.</summary>
+    static double Ease(double t)
+    {
+        return t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2;
+    }
+
+    protected virtual void OnBeforeShow(double current) { }
+    protected abstract void OnLevel(double alpha);      // 0..255
+    protected virtual void OnCleared() { }
+
+    public virtual void Dispose() { _anim.Dispose(); }
+
+    /// <summary>Gamma where it is allowed, overlay otherwise.</summary>
+    public static Dimmer Create()
+    {
+        if (GammaSupport.Unlocked)
+        {
+            var g = new GammaDimmer();
+            if (g.Usable) { Diagnostics.DimMethod = "gamma ramp"; return g; }
+            g.Dispose();        // key is set but the driver still refuses
+        }
+        Diagnostics.DimMethod = GammaSupport.Unlocked ? "overlay (gamma refused)" : "overlay";
+        return new DimOverlay();
+    }
+}
+
+/// <summary>
+/// Dims by scaling the display's gamma ramp. Nothing to composite, so it never
+/// appears in screenshots or screen shares and never sits on top of fullscreen
+/// apps - unlike the overlay.
+///
+/// The catch: a gamma ramp outlives the process. If this is killed while dark,
+/// the screen stays dark, so the original ramp is saved to disk and a marker
+/// file lets the next start put it back.
+/// </summary>
+class GammaDimmer : Dimmer
+{
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
+    [DllImport("gdi32.dll")] static extern bool GetDeviceGammaRamp(IntPtr hdc, ushort[] ramp);
+    [DllImport("gdi32.dll")] static extern bool SetDeviceGammaRamp(IntPtr hdc, ushort[] ramp);
+
+    static string SavedRampPath { get { return Path.Combine(KeyConfig.Dir, "gamma-original.bin"); } }
+    static string MarkerPath { get { return Path.Combine(KeyConfig.Dir, "gamma-active"); } }
+
+    readonly IntPtr _dc;
+    readonly ushort[] _original = new ushort[768];
+    readonly ushort[] _scratch = new ushort[768];
+    bool _marked;
+
+    public bool Usable { get; private set; }
+
+    public GammaDimmer()
+    {
+        _dc = GetDC(IntPtr.Zero);
+        if (_dc == IntPtr.Zero) return;
+        if (!GetDeviceGammaRamp(_dc, _original)) return;
+
+        // Prove a deep ramp is actually accepted before committing to this
+        // path; the registry value can be set while a driver still says no.
+        for (int c = 0; c < 3; c++)
+            for (int i = 0; i < 256; i++)
+                _scratch[c * 256 + i] = (ushort)(_original[c * 256 + i] * 0.30);
+
+        bool ok = SetDeviceGammaRamp(_dc, _scratch);
+        SetDeviceGammaRamp(_dc, _original);
+        Usable = ok;
+
+        if (Usable) SaveOriginal();
+    }
+
+    void SaveOriginal()
+    {
+        try
+        {
+            Directory.CreateDirectory(KeyConfig.Dir);
+            var bytes = new byte[_original.Length * 2];
+            Buffer.BlockCopy(_original, 0, bytes, 0, bytes.Length);
+            File.WriteAllBytes(SavedRampPath, bytes);
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// If a previous run was killed while the screen was dimmed, the ramp is
+    /// still dark. Put it back before doing anything else.
+    /// </summary>
+    public static void RecoverIfCrashed()
+    {
+        try
+        {
+            if (!File.Exists(MarkerPath)) return;
+
+            IntPtr dc = GetDC(IntPtr.Zero);
+            if (dc != IntPtr.Zero)
+            {
+                var ramp = new ushort[768];
+                if (File.Exists(SavedRampPath))
+                {
+                    var bytes = File.ReadAllBytes(SavedRampPath);
+                    if (bytes.Length == ramp.Length * 2) Buffer.BlockCopy(bytes, 0, ramp, 0, bytes.Length);
+                    else ramp = Identity();
+                }
+                else ramp = Identity();
+
+                SetDeviceGammaRamp(dc, ramp);
+                ReleaseDC(IntPtr.Zero, dc);
+            }
+            File.Delete(MarkerPath);
+        }
+        catch { }
+    }
+
+    static ushort[] Identity()
+    {
+        var r = new ushort[768];
+        for (int c = 0; c < 3; c++)
+            for (int i = 0; i < 256; i++)
+                r[c * 256 + i] = (ushort)Math.Min(65535, i * 257);
+        return r;
+    }
+
+    protected override void OnLevel(double alpha)
+    {
+        if (!Usable) return;
+
+        double keep = 1.0 - Math.Max(0, Math.Min(255, alpha)) / 255.0;
+        for (int c = 0; c < 3; c++)
+            for (int i = 0; i < 256; i++)
+                _scratch[c * 256 + i] = (ushort)(_original[c * 256 + i] * keep);
+
+        SetDeviceGammaRamp(_dc, _scratch);
+        Mark(alpha > 0.5);
+    }
+
+    protected override void OnCleared()
+    {
+        if (Usable) SetDeviceGammaRamp(_dc, _original);
+        Mark(false);
+    }
+
+    void Mark(bool dimmed)
+    {
+        if (dimmed == _marked) return;
+        _marked = dimmed;
+        try
+        {
+            if (dimmed) { Directory.CreateDirectory(KeyConfig.Dir); File.WriteAllText(MarkerPath, "1"); }
+            else if (File.Exists(MarkerPath)) File.Delete(MarkerPath);
+        }
+        catch { }
+    }
+
+    public override void Dispose()
+    {
+        base.Dispose();
+        if (_dc != IntPtr.Zero)
+        {
+            if (Usable) SetDeviceGammaRamp(_dc, _original);
+            ReleaseDC(IntPtr.Zero, _dc);
+        }
+        Mark(false);
+    }
+}
+
+/// <summary>Click-through black sheet over every monitor. The fallback when gamma is clamped.</summary>
+class DimOverlay : Dimmer
 {
     const int WS_EX_LAYERED = 0x00080000, WS_EX_TRANSPARENT = 0x00000020,
               WS_EX_TOOLWINDOW = 0x00000080, WS_EX_NOACTIVATE = 0x08000000;
@@ -1531,17 +1815,7 @@ class DimOverlay
         }
     }
 
-    // The panel ramps its own brightness on a curve, so a below-zero step that
-    // snapped instantly felt like a different control. Match it.
-    const int FadeMs = 170;
-
     readonly Sheet _form;
-    readonly System.Windows.Forms.Timer _anim;
-    readonly System.Diagnostics.Stopwatch _clock = new System.Diagnostics.Stopwatch();
-    double _from, _current;
-
-    /// <summary>Where the overlay is headed, not where the fade currently is.</summary>
-    public int Alpha { get; private set; }
 
     public DimOverlay()
     {
@@ -1554,8 +1828,6 @@ class DimOverlay
             StartPosition = FormStartPosition.Manual,
             Opacity = 0,
         };
-        _anim = new System.Windows.Forms.Timer { Interval = 10 };
-        _anim.Tick += Tick;
         _form.Bounds = SystemInformation.VirtualScreen;
         SystemEvents.DisplaySettingsChanged += (s, e) => _form.Bounds = SystemInformation.VirtualScreen;
 
@@ -1566,45 +1838,30 @@ class DimOverlay
         GC.KeepAlive(warm);
     }
 
-    public void Apply(int alpha)
+    protected override void OnBeforeShow(double current)
     {
-        if (alpha == Alpha && !_anim.Enabled) return;
-
-        Alpha = alpha;
-        _from = _current;                       // retarget mid-fade rather than jumping
-        _clock.Restart();
-
-        if (alpha > 0 && !_form.Visible)
-        {
-            // Alpha first, then reveal - never the other way round.
-            _form.Opacity = Math.Max(0, Math.Min(1, _current / 255.0));
-            if (_form.Bounds != SystemInformation.VirtualScreen) _form.Bounds = SystemInformation.VirtualScreen;
-            _form.Show();
-            _form.TopMost = true;
-        }
-
-        _anim.Start();
+        if (_form.Visible) return;
+        // Alpha first, then reveal - never the other way round.
+        _form.Opacity = Math.Max(0, Math.Min(1, current / 255.0));
+        if (_form.Bounds != SystemInformation.VirtualScreen) _form.Bounds = SystemInformation.VirtualScreen;
+        _form.Show();
+        _form.TopMost = true;
     }
 
-    void Tick(object sender, EventArgs e)
+    protected override void OnLevel(double alpha)
     {
-        double t = _clock.Elapsed.TotalMilliseconds / FadeMs;
-        bool done = t >= 1;
-        if (done) t = 1;
-
-        _current = _from + (Alpha - _from) * Ease(t);
-        _form.Opacity = Math.Max(0, Math.Min(1, _current / 255.0));
-
-        if (!done) return;
-        _anim.Stop();
-        _clock.Stop();
-        if (Alpha <= 0 && _form.Visible) _form.Hide();
+        _form.Opacity = Math.Max(0, Math.Min(1, alpha / 255.0));
     }
 
-    /// <summary>Ease in/out cubic - eases off at both ends like the panel's own ramp.</summary>
-    static double Ease(double t)
+    protected override void OnCleared()
     {
-        return t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2;
+        if (_form.Visible) _form.Hide();
+    }
+
+    public override void Dispose()
+    {
+        base.Dispose();
+        _form.Dispose();
     }
 }
 
@@ -1702,6 +1959,7 @@ class SetupForm : Form
     readonly Label _status = new Label();
     readonly Button _next = new Button();
     readonly Button _cancel = new Button();
+    readonly CheckBox _gamma = new CheckBox();
 
     RawInputListener _listen;
     KeyboardWatch _keys;
@@ -1727,7 +1985,7 @@ class SetupForm : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterScreen;
         MaximizeBox = MinimizeBox = false;
-        ClientSize = new Size(470, 236);
+        ClientSize = new Size(470, 286);
         BackColor = Color.FromArgb(24, 26, 32);
         ForeColor = Color.White;
         try { Icon = new Icon(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "app.ico")); } catch { }
@@ -1744,18 +2002,25 @@ class SetupForm : Form
         _status.Font = new Font("Consolas", 9f);
         _status.ForeColor = Color.FromArgb(150, 160, 178);
 
-        _next.SetBounds(330, 190, 112, 30);
+        _gamma.SetBounds(24, 176, 424, 46);
+        _gamma.Text = "Also enable deeper dimming (recommended)\r\nNeeds administrator once, and a restart to take effect.";
+        _gamma.Checked = true;
+        _gamma.Visible = false;
+        _gamma.ForeColor = Color.FromArgb(200, 208, 222);
+        _gamma.Font = new Font("Segoe UI", 8.75f);
+
+        _next.SetBounds(330, 240, 112, 30);
         _next.Text = "Continue";
         _next.Enabled = false;
         _next.FlatStyle = FlatStyle.System;
         _next.Click += (s, e) => Advance();
 
-        _cancel.SetBounds(210, 190, 108, 30);
+        _cancel.SetBounds(210, 240, 108, 30);
         _cancel.Text = "Cancel";
         _cancel.FlatStyle = FlatStyle.System;
         _cancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
 
-        Controls.AddRange(new Control[] { _step, _hint, _status, _next, _cancel });
+        Controls.AddRange(new Control[] { _step, _hint, _status, _gamma, _next, _cancel });
 
         _calibrate.Interval = 1500;
         _calibrate.Tick += (s, e) => { _calibrate.Stop(); _calibrating = false; ShowStatus(); };
@@ -1916,11 +2181,38 @@ class SetupForm : Form
             _hint.Text = "Darker:   " + Down.Describe() + "\r\n"
                        + "Brighter: " + Up.Describe() + "\r\n\r\n"
                        + "Saved to your profile. Choose \"Set up brightness keys\" again to redo it.";
+
+            // Below hardware zero this can either scale the display's gamma or
+            // lay a black sheet over everything. Gamma is better - invisible to
+            // screenshots and to fullscreen apps - but Windows clamps it until
+            // a machine-wide value is set, which needs administrator once.
+            _gamma.Visible = !GammaSupport.Unlocked;
             _status.Text = Down.ToString() + "   /   " + Up.ToString();
             _next.Text = "Finish";
             _next.Enabled = true;
             _cancel.Text = "Discard";
             return;
+        }
+
+        if (_gamma.Visible && _gamma.Checked)
+        {
+            _next.Enabled = false;
+            _step.Text = "Enabling deeper dimming...";
+            Application.DoEvents();
+
+            if (GammaSupport.RequestEnable())
+                MessageBox.Show(this,
+                    "Deeper dimming is enabled.\r\n\r\n"
+                    + "It takes effect after a restart. Until then the darkest steps "
+                    + "use a black overlay instead, which works just as well - it is "
+                    + "only visible to screenshots and fullscreen apps.",
+                    "BrightnessSteps", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            else
+                MessageBox.Show(this,
+                    "Deeper dimming was not enabled.\r\n\r\n"
+                    + "The darkest steps will keep using a black overlay, which works. "
+                    + "You can try again from the tray menu at any time.",
+                    "BrightnessSteps", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         DialogResult = DialogResult.OK;
