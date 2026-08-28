@@ -3,3 +3,5 @@ probe-log.txt
 selftest-trace.txt
 dist/
 icon-*.png
+site/hit.php
+site/data/

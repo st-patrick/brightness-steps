@@ -380,7 +380,8 @@ nothing.
 | `installer/` | Inno Setup script for the per-user installer |
 | `tools/makeicon.cs` | draws `app.ico` at eight sizes |
 | `tools/publish.ps1` | creates the repo and cuts a release |
-| `site/` | the landing page and its deploy script |
+| `site/` | the landing page, its deploy script, and the analytics endpoint |
+| `tools/stats.mjs` | prints the site's visit and download counts |
 
 Run `BrightnessSteps.exe --selftest` to drive the key path against a simulated
 Windows step and print the worst drift; see *Testing without a keyboard* above.

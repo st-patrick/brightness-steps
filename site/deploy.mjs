@@ -16,7 +16,7 @@ const SLUG = (process.env.SLUG || "brightness-steps").replace(/[^a-z0-9-]/gi, ""
 const REMOTE_DIR = `/projects/${SLUG}/`;
 const LIVE_URL = `https://projects.patrickreinbold.com/${SLUG}/`;
 
-const FILES = ["index.html", "icon.png", "og.png", "BrightnessSteps-setup.exe"];
+const FILES = ["index.html", "icon.png", "og.png", "hit.php", "BrightnessSteps-setup.exe"];
 
 // --- credentials: env first, then the shared secrets file --------------------
 let { LIMACITY_FTP_HOST: host, LIMACITY_FTP_USER: user, LIMACITY_FTP_PASS: pass } = process.env;
@@ -36,6 +36,20 @@ if (!host || !user || !pass) {
 if (!host || !user || !pass) {
   console.error("missing LIMACITY_FTP_* (env or ../../shared-config/secrets.env)");
   process.exit(1);
+}
+
+// hit.php carries the admin key that guards the stats endpoint, so it is built
+// here from a committed template plus a secret kept outside the repository.
+// Never commit the generated file - this is a public repo.
+{
+  const keyFile = Bun.file(join(ROOT, "..", "..", "shared-config", "brightness-steps-analytics.key"));
+  if (!(await keyFile.exists())) {
+    console.error("missing shared-config/brightness-steps-analytics.key");
+    process.exit(1);
+  }
+  const key = (await keyFile.text()).trim();
+  const tmpl = await Bun.file(join(ROOT, "hit.template.php")).text();
+  await Bun.write(join(ROOT, "hit.php"), tmpl.replace("__ADMIN_KEY__", key));
 }
 
 for (const f of FILES) {

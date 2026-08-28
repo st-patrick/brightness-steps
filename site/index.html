@@ -174,6 +174,8 @@
   <div class="wrap">
     MIT licensed · built and measured on a Surface Book 3 ·
     reports from other machines are the most useful thing you can contribute
+    <br><span style="opacity:.75">This page counts visits and download clicks on my own server.
+    No cookies, no IP addresses, no third parties, and Do Not Track is respected.</span>
   </div>
 </footer>
 
@@ -199,5 +201,36 @@
   draw('ours', ourSteps, 100);
 </script>
 
+
+<script>
+  // Minimal self-hosted counting: which events happened, and the referring
+  // host. No cookies, no identifiers, nothing third-party. Honours Do Not Track.
+  (function () {
+    var dnt = navigator.doNotTrack === '1' || window.doNotTrack === '1' || navigator.msDoNotTrack === '1';
+    if (dnt) return;
+
+    function hit(event) {
+      try {
+        var body = new URLSearchParams({ e: event, r: document.referrer || '' });
+        if (navigator.sendBeacon) navigator.sendBeacon('hit.php', body);
+        else fetch('hit.php', { method: 'POST', body: body, keepalive: true });
+      } catch (e) { /* counting must never break the page */ }
+    }
+
+    hit('view');
+
+    var watch = [
+      ['a[href$="setup.exe"]', 'download'],
+      ['a[href*="releases"]', 'portable'],
+      ['a[href*="github.com"]', 'github'],
+      ['a[href*="paypal"]', 'donate']
+    ];
+    watch.forEach(function (pair) {
+      document.querySelectorAll(pair[0]).forEach(function (el) {
+        el.addEventListener('click', function () { hit(pair[1]); });
+      });
+    });
+  })();
+</script>
 </body>
 </html>
