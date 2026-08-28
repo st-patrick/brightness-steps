@@ -93,7 +93,7 @@ class TrayApp : ApplicationContext
         _sync.CreateControl();
         var _ = _sync.Handle;
 
-        _guard = new Guard(_backlight);
+        _guard = new Guard();
         _index = IndexForHardware(_backlight.Get());
 
         _tray = new NotifyIcon
@@ -302,6 +302,11 @@ class Backlight : IDisposable
     byte _policy = DISPLAYPOLICY_AC;
     ManagementObject _wmiMethods;
 
+    // Preallocated: the guard polls these thousands of times per key press, and
+    // an AllocHGlobal per poll would be pure churn.
+    readonly IntPtr _queryBuf = Marshal.AllocHGlobal(3);
+    readonly IntPtr _setBuf = Marshal.AllocHGlobal(3);
+
     public Backlight() { Open(); }
 
     public bool UsingFastPath { get { return _device != (IntPtr)(-1); } }
@@ -346,18 +351,11 @@ class Backlight : IDisposable
     {
         level = 0;
         if (_device == (IntPtr)(-1)) return false;
-        IntPtr buf = Marshal.AllocHGlobal(3);
-        try
-        {
-            uint ret;
-            if (!DeviceIoControl(_device, IOCTL_QUERY_BRIGHTNESS, IntPtr.Zero, 0, buf, 3, out ret, IntPtr.Zero)) return false;
-            var db = (DISPLAY_BRIGHTNESS)Marshal.PtrToStructure(buf, typeof(DISPLAY_BRIGHTNESS));
-            _policy = db.ucDisplayPolicy;               // keep writing to whichever policy is live
-            level = db.ucDisplayPolicy == DISPLAYPOLICY_AC ? db.ucACBrightness : db.ucDCBrightness;
-            return true;
-        }
-        catch { return false; }
-        finally { Marshal.FreeHGlobal(buf); }
+        uint ret;
+        if (!DeviceIoControl(_device, IOCTL_QUERY_BRIGHTNESS, IntPtr.Zero, 0, _queryBuf, 3, out ret, IntPtr.Zero)) return false;
+        _policy = Marshal.ReadByte(_queryBuf, 0);       // keep writing to whichever policy is live
+        level = _policy == DISPLAYPOLICY_AC ? Marshal.ReadByte(_queryBuf, 1) : Marshal.ReadByte(_queryBuf, 2);
+        return true;
     }
 
     public int Get()
@@ -377,21 +375,11 @@ class Backlight : IDisposable
         {
             if (_device != (IntPtr)(-1))
             {
-                IntPtr buf = Marshal.AllocHGlobal(3);
-                try
-                {
-                    var db = new DISPLAY_BRIGHTNESS
-                    {
-                        ucDisplayPolicy = _policy,
-                        ucACBrightness = (byte)level,
-                        ucDCBrightness = (byte)level,
-                    };
-                    Marshal.StructureToPtr(db, buf, false);
-                    uint ret;
-                    if (DeviceIoControl(_device, IOCTL_SET_BRIGHTNESS, buf, 3, IntPtr.Zero, 0, out ret, IntPtr.Zero)) return;
-                }
-                catch { }
-                finally { Marshal.FreeHGlobal(buf); }
+                Marshal.WriteByte(_setBuf, 0, _policy);
+                Marshal.WriteByte(_setBuf, 1, (byte)level);
+                Marshal.WriteByte(_setBuf, 2, (byte)level);
+                uint ret;
+                if (DeviceIoControl(_device, IOCTL_SET_BRIGHTNESS, _setBuf, 3, IntPtr.Zero, 0, out ret, IntPtr.Zero)) return;
             }
         }
         WmiSet(level);
@@ -432,6 +420,8 @@ class Backlight : IDisposable
         lock (_lock)
         {
             if (_device != (IntPtr)(-1)) { CloseHandle(_device); _device = (IntPtr)(-1); }
+            Marshal.FreeHGlobal(_queryBuf);
+            Marshal.FreeHGlobal(_setBuf);
         }
     }
 }
@@ -445,16 +435,31 @@ class Guard : IDisposable
     [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint period);
     [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint period);
 
-    readonly Backlight _backlight;
+    // Windows lands its stomp ~20ms after the key. Sleep(1) polling leaves the
+    // wrong value up for ~1.8ms, which is invisible mid-range but not at the
+    // bottom, where a 10-point step is a ~10x change in light. So poll without
+    // sleeping across the window the stomp actually arrives in, then fall back
+    // to cheap sleep-polling for the long tail.
+    const int SpinMs = 70;
+
+    // Holding a brightness key repeats, and each repeat re-arms the spin. Stop
+    // spinning if that goes on unreasonably long, so a stuck key cannot pin a
+    // core indefinitely.
+    const int MaxContinuousSpinMs = 3000;
+
+    // The guard gets its OWN device handle rather than sharing the app's. While
+    // spinning it takes that handle's lock every fraction of a millisecond, and
+    // sharing it would stall the UI thread's own writes behind the spin.
+    readonly Backlight _backlight = new Backlight();
     readonly Thread _thread;
     readonly ManualResetEventSlim _wake = new ManualResetEventSlim(false);
     volatile int _target;
     long _untilTicks;
+    long _spinUntilTicks;
     volatile bool _stop;
 
-    public Guard(Backlight backlight)
+    public Guard()
     {
-        _backlight = backlight;
         _thread = new Thread(Run) { IsBackground = true, Name = "brightness-guard" };
         _thread.Start();
     }
@@ -462,7 +467,9 @@ class Guard : IDisposable
     public void Hold(int target, int ms)
     {
         _target = target;
-        Interlocked.Exchange(ref _untilTicks, DateTime.UtcNow.AddMilliseconds(ms).Ticks);
+        var now = DateTime.UtcNow;
+        Interlocked.Exchange(ref _untilTicks, now.AddMilliseconds(ms).Ticks);
+        Interlocked.Exchange(ref _spinUntilTicks, now.AddMilliseconds(SpinMs).Ticks);
         _wake.Set();
     }
 
@@ -473,14 +480,21 @@ class Guard : IDisposable
             _wake.Wait();
             if (_stop) return;
 
+            long startedAt = DateTime.UtcNow.Ticks;
             timeBeginPeriod(1);                 // Sleep(1) is ~15ms otherwise
             try
             {
-                while (!_stop && DateTime.UtcNow.Ticks < Interlocked.Read(ref _untilTicks))
+                while (!_stop)
                 {
+                    long now = DateTime.UtcNow.Ticks;
+                    if (now >= Interlocked.Read(ref _untilTicks)) break;
+
                     int cur = _backlight.Get();
                     if (cur != _target) _backlight.Set(_target);
-                    Thread.Sleep(1);
+
+                    bool spinBudgetLeft = (now - startedAt) < MaxContinuousSpinMs * TimeSpan.TicksPerMillisecond;
+                    if (now < Interlocked.Read(ref _spinUntilTicks) && spinBudgetLeft) Thread.SpinWait(30);
+                    else Thread.Sleep(1);
                 }
             }
             finally { timeEndPeriod(1); }
@@ -491,7 +505,13 @@ class Guard : IDisposable
         }
     }
 
-    public void Dispose() { _stop = true; _wake.Set(); }
+    public void Dispose()
+    {
+        _stop = true;
+        _wake.Set();
+        _thread.Join(500);
+        _backlight.Dispose();
+    }
 }
 
 /// <summary>
@@ -614,14 +634,22 @@ class DimOverlay
         };
         _form.Bounds = SystemInformation.VirtualScreen;
         SystemEvents.DisplaySettingsChanged += (s, e) => _form.Bounds = SystemInformation.VirtualScreen;
+
+        // Build the window up front. Created lazily on the first Show(), the
+        // layered alpha is applied a frame *after* the window first appears, so
+        // stepping into the dim region flashed fully-opaque black for a frame.
+        var warm = _form.Handle;
+        GC.KeepAlive(warm);
     }
 
     public void Apply(int alpha)
     {
         Alpha = alpha;
         if (alpha <= 0) { if (_form.Visible) _form.Hide(); return; }
-        _form.Bounds = SystemInformation.VirtualScreen;
+
+        // Alpha first, then reveal - never the other way round.
         _form.Opacity = alpha / 255.0;
+        if (_form.Bounds != SystemInformation.VirtualScreen) _form.Bounds = SystemInformation.VirtualScreen;
         if (!_form.Visible) _form.Show();
         _form.TopMost = true;
     }

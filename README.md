@@ -64,10 +64,49 @@ left to control is *how long*. Measured on this machine:
 | `IOCTL_VIDEO_SET_DISPLAY_BRIGHTNESS` | **0.16 ms** median |
 
 So brightness is read and written straight through the monitor device
-(`\\?\display#...`, opened unelevated), which is the layer underneath WMI. That
-is what makes a 1 ms poll loop affordable, and it cuts the window during which
-Windows' wrong value is on screen from ~10 ms to **1.8 ms measured**. WMI is
-kept only as a fallback if the device cannot be opened.
+(`\\?\display#...`, opened unelevated), which is the layer underneath WMI. WMI
+is kept only as a fallback if the device cannot be opened.
+
+That makes tight polling affordable. Measured, with the stomp coming from an
+independent device handle so it stands in for Windows rather than queueing
+behind the guard's own lock:
+
+| guard strategy | median | max |
+| --- | --- | --- |
+| `Sleep(1)` polling | 2.04 ms | 2.55 ms |
+| **spin polling** | **0.27 ms** | 0.44 ms |
+| WMI event driven | 3.29 ms | 224 ms |
+
+So the guard spins for the first 70 ms after a press — the window Windows' stomp
+actually lands in — then drops to `Sleep(1)` for the tail. The event-driven
+option looks tempting and is the worst of the three: it is slower in the median
+and occasionally hundreds of milliseconds late.
+
+Two consequences worth knowing:
+
+- The guard owns a **separate device handle** from the rest of the app. While
+  spinning it takes that handle's lock every fraction of a millisecond, and
+  sharing one handle would stall the UI thread's own writes behind the spin.
+  (Measuring this wrong — with a shared lock — made spinning look *worse* than
+  sleeping, which it is not.)
+- Spinning costs one core for up to 70 ms per press, and a held key re-arms it,
+  so it gives up after 3 s of continuous spinning. Idle cost is still zero: the
+  guard thread blocks on an event between presses.
+
+## Why the extremes flickered when the middle did not
+
+A 10-point step is a ~10 % change at the top of the range and a ~10x change at
+the bottom, so the same 2 ms is invisible mid-range and obvious near zero. Two
+separate causes turned up there:
+
+- **Stepping up out of the dim region.** Hardware sits at 0, Windows' step takes
+  it to 10, and against a near-black screen that is a huge relative jump. Fixed
+  by the spin guard above.
+- **Stepping down into the dim region.** Hardware is already 0 and Windows'
+  step is a no-op, so this one was entirely the overlay: the window was created
+  lazily on its first `Show()`, and the layered alpha got applied a frame *after*
+  the window first appeared — one frame of fully opaque black. The overlay
+  window is now built up front, and alpha is always set before it is revealed.
 
 One pleasant side effect of acting *before* Windows: Windows computes its step
 from whatever brightness it finds, which by then is already our new rung. So a
