@@ -1,0 +1,49 @@
+name: It does not work on my laptop
+description: The most useful report you can send. Takes about a minute.
+title: "[compat] "
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks. This was built and measured on one machine, so reports from
+        other hardware are genuinely the most valuable contribution.
+  - type: textarea
+    id: report
+    attributes:
+      label: Compatibility report
+      description: >
+        Right-click the tray icon and choose **Copy compatibility report**, then
+        paste it here. It contains your Windows version, machine model, which
+        brightness method was found and whether any keys were seen. Nothing
+        personal, and nothing is ever sent automatically.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: What happens
+      options:
+        - The brightness keys do nothing
+        - The keys work but the steps are wrong
+        - It says no adjustable display was found
+        - The screen flickers on every press
+        - Something else
+    validations:
+      required: true
+  - type: dropdown
+    id: setup
+    attributes:
+      label: Did you try "Set up brightness keys" in the tray menu?
+      options:
+        - "Yes, and it did not detect my keys"
+        - "Yes, and it detected them but they still do not work"
+        - "No"
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Laptop model, whether the keys need Fn, anything unusual.

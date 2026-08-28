@@ -30,8 +30,14 @@ dim the screen further, down to fully black.
 
 ## Install
 
-Download the installer from [Releases](../../releases), or grab
-`BrightnessSteps.exe` and run it — it is a single self-contained executable.
+Download the installer from [Releases](../../releases), or take the portable
+zip and run `BrightnessSteps.exe` directly — it is a single self-contained
+executable that needs nothing installed.
+
+> **Windows will say the publisher is unknown.** The installer is not
+> code-signed: a certificate costs more per year than this project will ever
+> make. Choose **More info → Run anyway**, or build it yourself — `build.ps1`
+> needs nothing but the `csc.exe` already in `C:\Windows\Microsoft.NET`.
 
 - Installs per user, so there is **no UAC prompt**
 - Needs .NET Framework 4.x, which ships with Windows 8 and later
