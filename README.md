@@ -93,6 +93,29 @@ Two consequences worth knowing:
   so it gives up after 3 s of continuous spinning. Idle cost is still zero: the
   guard thread blocks on an event between presses.
 
+## Can Windows' own handling just be turned off?
+
+No, not from user mode. `RegisterRawInputDevices` has flags for exactly this —
+`RIDEV_NOHOTKEYS` and `RIDEV_NOLEGACY` — and they are accepted for the keyboard
+collection but rejected for the consumer-control collection the brightness keys
+actually arrive on:
+
+| collection | `NOHOTKEYS` | `NOLEGACY \| NOHOTKEYS` |
+| --- | --- | --- |
+| consumer control `0C/01` (brightness keys) | rejected, `ERROR_INVALID_FLAGS` | rejected, `ERROR_INVALID_FLAGS` |
+| keyboard `01/06` | accepted | accepted |
+
+Disabling the HID device would stop Windows acting on the keys, but it would
+stop us seeing them too. Short of a HID filter driver, the step can only be
+raced, never prevented — so what is left is arming the race as early and as
+reliably as possible:
+
+- The guard is armed **before** any other work in a key press. It only needs the
+  target number, so the overlay, DWM and the popup must not sit in front of it.
+  Arming late is what let the occasional stomp slip through.
+- The guard thread runs at `ThreadPriority.Highest`. It is blocked between
+  presses, but must be scheduled *promptly* when woken.
+
 ## Why the extremes flickered when the middle did not
 
 A 10-point step is a ~10 % change at the top of the range and a ~10x change at

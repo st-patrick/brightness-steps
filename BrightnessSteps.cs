@@ -175,6 +175,13 @@ class TrayApp : ApplicationContext
         _index = i;
         Step s = Ladder[i];
 
+        // Arm the guard FIRST. Windows' stomp is coming in ~20ms and the guard
+        // only needs the target number, so nothing that can block - showing the
+        // overlay window, DWM, painting the popup - should sit in front of it.
+        // Arming late is what let the occasional stomp through.
+        _guardEndsAt = DateTime.UtcNow.AddMilliseconds(GuardMs);
+        _guard.Hold(s.Hw, GuardMs);
+
         // Raise hardware before lifting the overlay, and drop the overlay before
         // lowering hardware - otherwise the step flashes bright for a frame.
         if (s.Alpha == 0)
@@ -187,10 +194,6 @@ class TrayApp : ApplicationContext
             _overlay.Apply(s.Alpha);
             SetHardware(s.Hw);
         }
-
-        // Windows is about to apply its own +/-10 from here. Hold our value.
-        _guardEndsAt = DateTime.UtcNow.AddMilliseconds(GuardMs);
-        _guard.Hold(s.Hw, GuardMs);
 
         if (_showOsd) _osd.Show(i, Ladder.Length, DescribeStep(s));
     }
@@ -460,7 +463,15 @@ class Guard : IDisposable
 
     public Guard()
     {
-        _thread = new Thread(Run) { IsBackground = true, Name = "brightness-guard" };
+        _thread = new Thread(Run)
+        {
+            IsBackground = true,
+            Name = "brightness-guard",
+            // It sleeps blocked between presses and spins for at most 70ms after
+            // one, but it has to be scheduled *promptly* when woken - being put
+            // behind other work is exactly what makes the stomp slip through.
+            Priority = ThreadPriority.Highest,
+        };
         _thread.Start();
     }
 
@@ -618,7 +629,16 @@ class DimOverlay
         }
     }
 
+    // The panel ramps its own brightness on a curve, so a below-zero step that
+    // snapped instantly felt like a different control. Match it.
+    const int FadeMs = 170;
+
     readonly Sheet _form;
+    readonly System.Windows.Forms.Timer _anim;
+    readonly System.Diagnostics.Stopwatch _clock = new System.Diagnostics.Stopwatch();
+    double _from, _current;
+
+    /// <summary>Where the overlay is headed, not where the fade currently is.</summary>
     public int Alpha { get; private set; }
 
     public DimOverlay()
@@ -632,6 +652,8 @@ class DimOverlay
             StartPosition = FormStartPosition.Manual,
             Opacity = 0,
         };
+        _anim = new System.Windows.Forms.Timer { Interval = 10 };
+        _anim.Tick += Tick;
         _form.Bounds = SystemInformation.VirtualScreen;
         SystemEvents.DisplaySettingsChanged += (s, e) => _form.Bounds = SystemInformation.VirtualScreen;
 
@@ -644,14 +666,43 @@ class DimOverlay
 
     public void Apply(int alpha)
     {
-        Alpha = alpha;
-        if (alpha <= 0) { if (_form.Visible) _form.Hide(); return; }
+        if (alpha == Alpha && !_anim.Enabled) return;
 
-        // Alpha first, then reveal - never the other way round.
-        _form.Opacity = alpha / 255.0;
-        if (_form.Bounds != SystemInformation.VirtualScreen) _form.Bounds = SystemInformation.VirtualScreen;
-        if (!_form.Visible) _form.Show();
-        _form.TopMost = true;
+        Alpha = alpha;
+        _from = _current;                       // retarget mid-fade rather than jumping
+        _clock.Restart();
+
+        if (alpha > 0 && !_form.Visible)
+        {
+            // Alpha first, then reveal - never the other way round.
+            _form.Opacity = Math.Max(0, Math.Min(1, _current / 255.0));
+            if (_form.Bounds != SystemInformation.VirtualScreen) _form.Bounds = SystemInformation.VirtualScreen;
+            _form.Show();
+            _form.TopMost = true;
+        }
+
+        _anim.Start();
+    }
+
+    void Tick(object sender, EventArgs e)
+    {
+        double t = _clock.Elapsed.TotalMilliseconds / FadeMs;
+        bool done = t >= 1;
+        if (done) t = 1;
+
+        _current = _from + (Alpha - _from) * Ease(t);
+        _form.Opacity = Math.Max(0, Math.Min(1, _current / 255.0));
+
+        if (!done) return;
+        _anim.Stop();
+        _clock.Stop();
+        if (Alpha <= 0 && _form.Visible) _form.Hide();
+    }
+
+    /// <summary>Ease in/out cubic - eases off at both ends like the panel's own ramp.</summary>
+    static double Ease(double t)
+    {
+        return t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2;
     }
 }
 
