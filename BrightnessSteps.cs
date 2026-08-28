@@ -87,8 +87,7 @@ class TrayApp : ApplicationContext
     // under _ladderLock or interlocked.
     readonly object _ladderLock = new object();
     int _index;
-    volatile int _lastSelfSet = -1;
-    long _lastSelfSetAtTicks;
+    volatile int _desiredHw = -1;       // the hardware value the current rung asks for
     long _guardEndsAtTicks;
     volatile bool _showOsd = true;
 
@@ -98,7 +97,9 @@ class TrayApp : ApplicationContext
         var _ = _sync.Handle;
 
         _guard = new Guard();
-        _index = IndexForHardware(_backlight.Get());
+        int hw = _backlight.Get();
+        _desiredHw = hw;
+        _index = IndexForHardware(hw);
 
         _tray = new NotifyIcon
         {
@@ -231,8 +232,7 @@ class TrayApp : ApplicationContext
 
     void SetHardware(int level)
     {
-        _lastSelfSet = level;
-        Interlocked.Exchange(ref _lastSelfSetAtTicks, DateTime.UtcNow.Ticks);
+        _desiredHw = level;
         _backlight.Set(level);
     }
 
@@ -244,17 +244,18 @@ class TrayApp : ApplicationContext
         {
             var w = new ManagementEventWatcher(new ManagementScope(@"root\WMI"),
                         new WqlEventQuery("SELECT * FROM WmiMonitorBrightnessEvent"));
+            // The event is only a nudge that *something* changed; its value is
+            // read fresh from the hardware in the handler.
             w.EventArrived += (s, e) =>
             {
-                int hw = Convert.ToInt32(e.NewEvent.Properties["Brightness"].Value);
-                try { _sync.BeginInvoke((Action)(() => OnExternalBrightness(hw))); } catch { }
+                try { _sync.BeginInvoke((Action)OnExternalBrightness); } catch { }
             };
             w.Start();
         }
         catch { }
     }
 
-    void OnExternalBrightness(int hw)
+    void OnExternalBrightness()
     {
         long now = DateTime.UtcNow.Ticks;
 
@@ -262,12 +263,24 @@ class TrayApp : ApplicationContext
         // are Windows' stomp and our corrections racing each other.
         if (now < Interlocked.Read(ref _guardEndsAtTicks) + 250 * TimeSpan.TicksPerMillisecond) return;
 
-        // Our own write echoing back.
-        if (hw == _lastSelfSet && now - Interlocked.Read(ref _lastSelfSetAtTicks) < 2500 * TimeSpan.TicksPerMillisecond) return;
+        // Deliberately ignore the value the event carries. It reports brightness
+        // as it was at the moment of the change, and delivery can lag by
+        // hundreds of milliseconds - long enough for the guard to have already
+        // put the value back. Acting on that stale number resynced the ladder to
+        // Windows' stomp and cleared the overlay, which in the dim zone reads as
+        // a jump up to the 0 rung. Ask the hardware what is actually true now.
+        int actual = _backlight.Get();
 
-        // Nobody pressed a key, so this is the slider (or battery saver, or
-        // adaptive brightness) moving things. Follow it rather than fight it.
-        lock (_ladderLock) { _index = IndexForHardware(hw); }
+        // Still where we put it, so nothing external really happened. Compared
+        // against the rung's own value rather than a recency window: sitting in
+        // the dim zone longer than the old 2.5s timeout let any unrelated
+        // brightness event clear the overlay out from under us.
+        if (actual == _desiredHw) return;
+
+        // A real external change - the slider, battery saver, adaptive
+        // brightness. Follow it rather than fight it.
+        _desiredHw = actual;
+        lock (_ladderLock) { _index = IndexForHardware(actual); }
         if (_overlay.Alpha != 0) _overlay.Apply(0);
     }
 }

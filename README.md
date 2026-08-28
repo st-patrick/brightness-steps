@@ -53,6 +53,17 @@ saver, adaptive brightness — are followed rather than fought, and clear the
 overlay. The guard window is excluded from that, since during it we are
 deliberately overriding Windows.
 
+**The brightness event's value is deliberately ignored.** It reports brightness
+as it was at the moment of the change, and delivery can lag by hundreds of
+milliseconds (224 ms observed) — long enough for the guard to have already put
+the value back. Acting on that stale number resynced the ladder to Windows'
+stomp and cleared the overlay, which in the dim zone shows up as a jump to the
+`0` rung and back. The handler now treats the event purely as a nudge that
+something changed and re-reads the hardware, which is cheap. It compares against
+the current rung's own hardware value rather than a recency window, too: with a
+2.5 s echo window, sitting in the dim zone longer than that let any unrelated
+brightness event clear the overlay out from under it.
+
 ## Why it goes through the display driver, not WMI
 
 Windows' step cannot be blocked, so it is always briefly visible. The only thing
