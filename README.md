@@ -159,6 +159,38 @@ drift at 35 ms between presses went from **33 points to 10**; at 120 ms it is 0.
 The remaining 10 points is one uncorrected step still settling at the moment of
 sampling, and it is a property of the display driver rather than of this code.
 
+## Would running as administrator help? No — measured, not assumed
+
+Every limit here is an API restriction or driver behaviour, not an access
+check. Tested elevated and unelevated:
+
+| lever | result |
+| --- | --- |
+| `RegisterRawInputDevices` with `NOHOTKEYS` on `0C/01` | `ERROR_INVALID_FLAGS` either way — flag validation, not privilege |
+| Exclusive `CreateFile` on the consumer-control HID collections | `ERROR_SHARING_VIOLATION` (32) either way, on all four collections |
+| Stopping `DisplayEnhancementService` (needs admin) | Windows **still** stepped brightness: 151 key presses, 48 changes |
+
+The HID result is the informative one. The failure is a *sharing violation*, not
+`ACCESS_DENIED` — the kernel input stack already holds those collections open,
+and sharing is enforced by the object manager against existing handles. No
+privilege overrides that. Elevated output was byte-identical to unelevated.
+
+Stopping the display service did change Windows' behaviour — its stepping
+degraded to toggling between 0 and 13 — but it did not stop it, and it is not
+where the hotkey is handled.
+
+So the app deliberately does **not** request elevation: it would cost a UAC
+prompt on every boot and buy nothing. The only remaining way to truly block the
+key is a kernel-mode HID filter driver, which needs test-signing or an EV
+certificate — far past what this is worth.
+
+One thing admin *could* enable, if the overlay ever becomes a nuisance:
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM\GdiIcmGammaRange = 256`
+(admin + reboot) lifts the gamma clamp, which would allow below-zero dimming via
+a gamma ramp instead of a layered window — no sheet in screenshots or over
+fullscreen apps. It would **not** reduce flicker, since that is about backlight
+writes, and gamma can be reset by other colour-management software.
+
 ## Testing without a keyboard
 
 Raw HID reports cannot be injected, so `BrightnessSteps.exe --selftest` drives
