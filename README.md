@@ -364,6 +364,13 @@ pinned at 0, Windows' step cannot go lower, and only the overlay changes.
 - **Darker / Brighter** — step the ladder without the keys
 - **Exit**
 
+## Support
+
+Free, and staying that way. If it made your evenings easier, there is a
+[coffee fund](https://www.paypal.com/paypalme/PatrickReinbold) — entirely
+optional. Telling me it does not work on your laptop is worth more, and costs
+nothing.
+
 ## Files
 
 | file | purpose |
