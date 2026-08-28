@@ -16,7 +16,7 @@ const SLUG = (process.env.SLUG || "brightness-steps").replace(/[^a-z0-9-]/gi, ""
 const REMOTE_DIR = `/projects/${SLUG}/`;
 const LIVE_URL = `https://projects.patrickreinbold.com/${SLUG}/`;
 
-const FILES = ["index.html", "icon.png", "og.png", "hit.php", "BrightnessSteps-setup.exe"];
+const FILES = ["index.html", "stats.html", "icon.png", "og.png", "hit.php", "BrightnessSteps-setup.exe"];
 
 // --- credentials: env first, then the shared secrets file --------------------
 let { LIMACITY_FTP_HOST: host, LIMACITY_FTP_USER: user, LIMACITY_FTP_PASS: pass } = process.env;

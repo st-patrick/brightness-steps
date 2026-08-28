@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>BrightnessSteps — stats</title>
+<link rel="icon" href="icon.png">
+<style>
+  :root{ --bg:#0d0f14; --panel:#151922; --line:#232936; --ink:#e8ecf4; --dim:#98a2b6; --gold:#f0c987; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:840px;margin:0 auto;padding:32px 20px 64px}
+  h1{font-size:1.5rem;margin:0 0 4px;letter-spacing:-.01em}
+  .sub{color:var(--dim);margin:0 0 28px;font-size:.9rem}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:30px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .card .n{font-size:1.9rem;font-weight:700;color:var(--gold);line-height:1.15}
+  .card .k{font-size:.76rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-top:4px}
+  .card .p{font-size:.78rem;color:var(--dim);margin-top:2px}
+  h2{font-size:1rem;margin:26px 0 12px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+  table{width:100%;border-collapse:collapse;font-size:.9rem}
+  td,th{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left}
+  th{color:var(--dim);font-size:.74rem;text-transform:uppercase;letter-spacing:.07em}
+  td.n{text-align:right;font-variant-numeric:tabular-nums;width:64px}
+  .bar{height:9px;background:var(--gold);border-radius:3px;min-width:2px;opacity:.85}
+  .barcell{width:55%}
+  input{background:#0f131b;border:1px solid var(--line);color:var(--ink);padding:9px 12px;
+    border-radius:8px;width:320px;max-width:100%;font-family:Consolas,monospace}
+  button{background:var(--gold);color:#20160a;border:0;padding:10px 18px;border-radius:8px;
+    font-weight:600;cursor:pointer;margin-left:8px}
+  .err{color:#ff9b9b}
+  .empty{color:var(--dim);padding:20px 0}
+  a{color:var(--gold)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BrightnessSteps</h1>
+  <p class="sub">Visits and download clicks · <a href="./">back to the page</a></p>
+
+  <div id="gate" style="display:none">
+    <p class="sub">Paste the admin key. It is remembered in this browser only.</p>
+    <input id="key" type="password" placeholder="admin key" autocomplete="off">
+    <button id="go">Show</button>
+    <p id="err" class="err"></p>
+  </div>
+
+  <div id="out" style="display:none">
+    <div class="cards" id="cards"></div>
+    <h2>Last 21 days</h2>
+    <div id="days"></div>
+    <h2>Where visitors came from</h2>
+    <div id="refs"></div>
+    <p class="sub" id="updated" style="margin-top:26px"></p>
+    <p class="sub"><a href="#" id="forget">Forget the key on this device</a></p>
+  </div>
+</div>
+
+<script>
+  var LS = 'bs-stats-key';
+
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
+    return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]; }); }
+
+  function card(n, k, p) {
+    return '<div class="card"><div class="n">' + n + '</div><div class="k">' + k + '</div>'
+         + (p ? '<div class="p">' + p + '</div>' : '') + '</div>';
+  }
+
+  function rows(pairs, max, label) {
+    if (!pairs.length) return '<p class="empty">Nothing yet.</p>';
+    var h = '<table><tr><th>' + label + '</th><th></th><th class="n">n</th></tr>';
+    pairs.forEach(function (p) {
+      var w = max ? Math.max(2, Math.round(p[1] / max * 100)) : 0;
+      h += '<tr><td>' + esc(p[0]) + '</td><td class="barcell"><div class="bar" style="width:'
+         + w + '%"></div></td><td class="n">' + p[1] + '</td></tr>';
+    });
+    return h + '</table>';
+  }
+
+  function render(d) {
+    var t = d.totals || {};
+    var v = t.view || 0;
+    var pct = function (n) { return v ? (n / v * 100).toFixed(1) + '% of visits' : ''; };
+
+    document.getElementById('cards').innerHTML =
+        card(v, 'visits')
+      + card(t.download || 0, 'installer', pct(t.download || 0))
+      + card(t.portable || 0, 'portable zip', pct(t.portable || 0))
+      + card(t.github || 0, 'github', pct(t.github || 0))
+      + card(t.donate || 0, 'donate', pct(t.donate || 0));
+
+    var days = Object.keys(d.days || {}).sort().reverse().slice(0, 21);
+    var maxV = 0;
+    days.forEach(function (k) { maxV = Math.max(maxV, d.days[k].view || 0); });
+    document.getElementById('days').innerHTML = rows(
+      days.map(function (k) { return [k, d.days[k].view || 0]; }), maxV, 'day');
+
+    var refs = Object.keys(d.refs || {}).map(function (k) { return [k, d.refs[k]]; })
+      .sort(function (a, b) { return b[1] - a[1]; }).slice(0, 20);
+    document.getElementById('refs').innerHTML = rows(refs, refs.length ? refs[0][1] : 0, 'referrer');
+
+    document.getElementById('updated').textContent = d.updated ? 'updated ' + d.updated : '';
+    document.getElementById('gate').style.display = 'none';
+    document.getElementById('out').style.display = '';
+  }
+
+  function load(key) {
+    return fetch('hit.php?stats=' + encodeURIComponent(key) + '&t=' + Date.now())
+      .then(function (r) {
+        if (!r.ok) throw new Error('That key was not accepted.');
+        return r.json();
+      })
+      .then(function (d) {
+        try { localStorage.setItem(LS, key); } catch (e) {}
+        render(d.totals ? d : { totals: {}, days: {}, refs: {} });
+      });
+  }
+
+  function gate(msg) {
+    document.getElementById('gate').style.display = '';
+    document.getElementById('err').textContent = msg || '';
+  }
+
+  document.getElementById('go').onclick = function () {
+    var k = document.getElementById('key').value.trim();
+    if (k) load(k).catch(function (e) { gate(e.message); });
+  };
+  document.getElementById('key').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('go').click();
+  });
+  document.getElementById('forget').onclick = function (e) {
+    e.preventDefault();
+    try { localStorage.removeItem(LS); } catch (err) {}
+    location.hash = '';
+    location.reload();
+  };
+
+  // The key may arrive in the fragment, which browsers never send to the server.
+  var fromHash = (location.hash.match(/key=([a-f0-9]+)/) || [])[1];
+  var stored = null;
+  try { stored = localStorage.getItem(LS); } catch (e) {}
+  var key = fromHash || stored;
+
+  if (fromHash) history.replaceState(null, '', location.pathname);
+  if (key) load(key).catch(function (e) { gate(e.message); });
+  else gate();
+</script>
+</body>
+</html>
